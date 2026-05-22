@@ -8,7 +8,7 @@ _BASE_URL = "https://api.notion.com/v1"
 _FILTER = {
     "and": [
         {
-            "property": "Task Due Date",
+            "property": "Task Due date",
             "date": {"is_empty": True},
         },
         {
@@ -37,7 +37,7 @@ def get_tasks_missing_due_date(token: str, database_id: str) -> list[dict]:
 
         for page in data.get("results", []):
             props = page.get("properties", {})
-            title_parts = props.get("Task Name", {}).get("title", [])
+            title_parts = props.get("Task name", {}).get("title", [])
             name = "".join(t.get("plain_text", "") for t in title_parts) or "(Untitled)"
             tasks.append({"name": name, "url": page.get("url", "")})
 
