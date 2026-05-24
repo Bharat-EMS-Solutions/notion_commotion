@@ -22,29 +22,43 @@ Each task row shows: name (linked to Notion), status, priority, team tags, and a
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment
+### 2. Configure secrets
 
 ```bash
 cp .env.example .env
 ```
 
-Fill in all values in `.env`:
+Fill in `.env` with secrets only:
 
 ```env
-# Notion
 NOTION_TOKEN=secret_...
 NOTION_DATABASE_ID=<32-char database ID>
 NOTION_DATABASE_2_ID=<32-char database ID>
 
-# Azure AD app registration
 AZURE_TENANT_ID=...
 AZURE_CLIENT_ID=...
 AZURE_CLIENT_SECRET=...
-
-# Email
-SENDER_EMAIL=sender@yourdomain.com
-RECIPIENT_EMAIL=recipient@yourdomain.com
 ```
+
+### 3. Configure app settings
+
+```bash
+cp config.json.example config.json
+```
+
+Fill in `config.json`:
+
+```json
+{
+  "sender_email": "sender@yourdomain.com",
+  "recipient_emails": [
+    "recipient1@yourdomain.com",
+    "recipient2@yourdomain.com"
+  ]
+}
+```
+
+Add as many recipients as needed. `config.json` is gitignored.
 
 **Finding a database ID:** Open the database in Notion, copy the URL. The ID is the 32-character string *before* the `?` — not the `v=` view parameter.
 

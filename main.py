@@ -19,6 +19,8 @@ import os
 import sys
 from pathlib import Path
 
+_CONFIG_FILE   = Path(__file__).parent / "config.json"
+
 from dotenv import load_dotenv
 
 from mailer import send_reminder_email
@@ -36,11 +38,27 @@ _REQUIRED_ENV = [
     "AZURE_TENANT_ID",
     "AZURE_CLIENT_ID",
     "AZURE_CLIENT_SECRET",
-    "SENDER_EMAIL",
-    "RECIPIENT_EMAIL",
 ]
 
-_CONFIG_FILE = Path(__file__).parent / "databases.json"
+_DB_CONFIG_FILE = Path(__file__).parent / "databases.json"
+
+
+def load_app_config() -> dict:
+    """Read config.json and return its contents."""
+    if not _CONFIG_FILE.exists():
+        log.error("config.json not found — copy config.json.example to config.json and fill it in")
+        sys.exit(1)
+    try:
+        cfg = json.loads(_CONFIG_FILE.read_text())
+    except json.JSONDecodeError as exc:
+        log.error("config.json is not valid JSON: %s", exc)
+        sys.exit(1)
+    required = ["sender_email", "recipient_emails"]
+    missing = [k for k in required if not cfg.get(k)]
+    if missing:
+        log.error("config.json is missing required keys: %s", ", ".join(missing))
+        sys.exit(1)
+    return cfg
 
 
 def load_databases() -> list[tuple[str, dict]]:
@@ -49,12 +67,12 @@ def load_databases() -> list[tuple[str, dict]]:
     Entries whose env var is missing are skipped with a warning.
     Returns [(database_id, fields_dict), ...]
     """
-    if not _CONFIG_FILE.exists():
-        log.error("databases.json not found at %s", _CONFIG_FILE)
+    if not _DB_CONFIG_FILE.exists():
+        log.error("databases.json not found at %s", _DB_CONFIG_FILE)
         sys.exit(1)
 
     try:
-        entries = json.loads(_CONFIG_FILE.read_text())
+        entries = json.loads(_DB_CONFIG_FILE.read_text())
     except json.JSONDecodeError as exc:
         log.error("databases.json is not valid JSON: %s", exc)
         sys.exit(1)
@@ -84,15 +102,16 @@ def main() -> None:
         log.error("Missing required environment variables: %s", ", ".join(missing))
         sys.exit(1)
 
+    cfg = load_app_config()
     databases = load_databases()
     log.info("Loaded %d database(s) from databases.json", len(databases))
 
     mail_kwargs = dict(
-        tenant_id       = os.environ["AZURE_TENANT_ID"],
-        client_id       = os.environ["AZURE_CLIENT_ID"],
-        client_secret   = os.environ["AZURE_CLIENT_SECRET"],
-        sender_email    = os.environ["SENDER_EMAIL"],
-        recipient_email = os.environ["RECIPIENT_EMAIL"],
+        tenant_id        = os.environ["AZURE_TENANT_ID"],
+        client_id        = os.environ["AZURE_CLIENT_ID"],
+        client_secret    = os.environ["AZURE_CLIENT_SECRET"],
+        sender_email     = cfg["sender_email"],
+        recipient_emails = cfg["recipient_emails"],
     )
 
     failed = False

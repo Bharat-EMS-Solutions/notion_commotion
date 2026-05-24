@@ -1,0 +1,7 @@
+{
+  "sender_email": "sender@yourdomain.com",
+  "recipient_emails": [
+    "recipient1@yourdomain.com",
+    "recipient2@yourdomain.com"
+  ]
+}

@@ -1,6 +1,7 @@
-# Secrets — never commit
+# Secrets and local config — never commit
 .env
 *.env
+config.json
 
 # Python
 __pycache__/

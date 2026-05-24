@@ -303,7 +303,7 @@ def send_reminder_email(
     client_id: str,
     client_secret: str,
     sender_email: str,
-    recipient_email: str,
+    recipient_emails: list[str],
     report: dict,
 ) -> None:
     token = _acquire_token(tenant_id, client_id, client_secret)
@@ -318,7 +318,7 @@ def send_reminder_email(
                 f"({date.today().strftime('%d %b %Y')})"
             ),
             "body": {"contentType": "HTML", "content": _build_html(report)},
-            "toRecipients": [{"emailAddress": {"address": recipient_email}}],
+            "toRecipients": [{"emailAddress": {"address": r}} for r in recipient_emails],
         }
     }
     resp = requests.post(
