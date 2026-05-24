@@ -67,11 +67,37 @@ python main.py
 
 ## Adding a database
 
-1. Define a field config in `notion_client.py` (copy `DB1_FIELDS` or `DB2_FIELDS` and adjust property names to match your database — they are case-sensitive)
-2. Add `NOTION_DATABASE_N_ID` to `.env`
-3. Append `(os.environ["NOTION_DATABASE_N_ID"], DBN_FIELDS)` to the `databases` list in `main.py`
+No Python changes needed — everything is driven by `databases.json` and `.env`.
 
-Set a field to `None` to skip that section for a given database (e.g. `"reviewer": None`).
+**1. Add the ID to `.env`:**
+```
+NOTION_DATABASE_3_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+**2. Add an entry to `databases.json`:**
+```json
+{
+  "env_var": "NOTION_DATABASE_3_ID",
+  "fields": {
+    "title":       "Task name",
+    "due_date":    "Due date",
+    "status":      "Status",
+    "done_value":  "Done",
+    "owner":       "Assignee",
+    "reviewer":    null,
+    "overdue":     "Overdue",
+    "history":     "Due Date History",
+    "description": "Description",
+    "priority":    "Priority",
+    "team":        "Team",
+    "project":     "Project",
+    "parent_task": "Parent task"
+  }
+}
+```
+
+Set any field to `null` to skip that section (e.g. `"reviewer": null` omits No Reviewer).
+Property names are case-sensitive — verify them in Notion via the column header → Edit property.
 
 ## Scheduling
 
