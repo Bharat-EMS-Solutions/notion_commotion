@@ -17,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
-from mailer import _ALL_SECTIONS, _PRIORITY_COLORS, _group_tasks
+from mailer import _ALL_SECTIONS, _PRIORITY_COLORS, _group_tasks, send_reminder_email
 from notion_client import get_task_report, get_users, scan_user_mentions
 
 load_dotenv()
@@ -25,7 +25,8 @@ load_dotenv()
 app = Flask(__name__)
 log = logging.getLogger(__name__)
 
-_DB_CONFIG_FILE = Path(__file__).parent / "databases.json"
+_DB_CONFIG_FILE  = Path(__file__).parent / "databases.json"
+_APP_CONFIG_FILE = Path(__file__).parent / "config.json"
 
 
 def _load_databases():
@@ -168,6 +169,7 @@ def _render_report_html(reports: list, active_idx: int) -> str:
         f'All collapsed</span>'
         f'<button id="expand-btn"   onclick="expandStep()"   class="ctrl-btn">Expand +</button>'
         f'<button id="collapse-btn" onclick="collapseStep()" class="ctrl-btn" disabled>Collapse −</button>'
+        f'<button id="send-btn" onclick="sendReport()" class="ctrl-btn">✉ Send Report</button>'
         f'<a href="/mentions" class="refresh-btn">⊕ Mentions</a>'
         f'<a href="/" class="refresh-btn">↺ Refresh</a>'
         f'</div>'
@@ -395,6 +397,27 @@ function toggleGroup(header) {
   var icon = header.querySelector('.toggle-icon');
   var collapsed = body.classList.toggle('collapsed');
   icon.style.transform = collapsed ? 'rotate(-90deg)' : 'rotate(0deg)';
+}
+
+/* ---- Send report ---- */
+function sendReport() {
+  if (!confirm('Send the task health report email to all configured recipients?')) return;
+  var btn = document.getElementById('send-btn');
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+  fetch('/send-report', {method:'POST'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      btn.textContent = d.ok ? '✓ Sent' : '✗ Failed';
+      btn.style.background = d.ok ? '#10b981' : '#dc2626';
+      btn.style.color = '#fff';
+      if (!d.ok) alert('Send error: ' + d.msg);
+    })
+    .catch(function(){
+      btn.textContent = '✗ Error';
+      btn.style.background = '#dc2626';
+      btn.disabled = false;
+    });
 }
 
 /* ---- Loading / report injection ---- */
@@ -650,6 +673,68 @@ def mentions():
         yield '</body></html>\n'
 
     return Response(stream_with_context(generate()), mimetype="text/html")
+
+
+@app.route("/send-report", methods=["POST"])
+def send_report():
+    token = os.environ.get("NOTION_TOKEN", "")
+
+    # Load app config (sender, global recipients, Azure creds)
+    if not _APP_CONFIG_FILE.exists():
+        return {"ok": False, "msg": "config.json not found"}, 400
+    try:
+        cfg = json.loads(_APP_CONFIG_FILE.read_text())
+    except Exception as exc:
+        return {"ok": False, "msg": f"config.json invalid: {exc}"}, 400
+
+    missing_env = [k for k in ("AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET")
+                   if not os.environ.get(k)]
+    if missing_env:
+        return {"ok": False, "msg": f"Missing env vars: {', '.join(missing_env)}"}, 400
+
+    # Load databases with per-DB recipient overrides
+    try:
+        entries = json.loads(_DB_CONFIG_FILE.read_text())
+    except Exception as exc:
+        return {"ok": False, "msg": f"databases.json invalid: {exc}"}, 400
+
+    databases = [
+        (os.getenv(e.get("env_var", "")), e.get("fields", {}), e.get("recipient_emails", []))
+        for e in entries
+        if os.getenv(e.get("env_var", ""))
+    ]
+    if not databases:
+        return {"ok": False, "msg": "No databases resolved from databases.json"}, 400
+
+    mail_kwargs = dict(
+        tenant_id     = os.environ["AZURE_TENANT_ID"],
+        client_id     = os.environ["AZURE_CLIENT_ID"],
+        client_secret = os.environ["AZURE_CLIENT_SECRET"],
+        sender_email  = cfg["sender_email"],
+    )
+
+    sent, errors = 0, []
+    for db_id, fields, db_recipients in databases:
+        try:
+            report = get_task_report(token, db_id, fields)
+        except Exception as exc:
+            errors.append(f"Query failed ({db_id[:8]}…): {exc}")
+            continue
+        recipients = db_recipients or cfg["recipient_emails"]
+        try:
+            send_reminder_email(**mail_kwargs, recipient_emails=recipients, report=report)
+            sent += 1
+            log.info("[%s] Email sent via dashboard trigger.", report["db_name"])
+        except Exception as exc:
+            errors.append(f"Email failed ({report['db_name']}): {exc}")
+
+    if errors and sent == 0:
+        return {"ok": False, "msg": "; ".join(errors)}, 500
+
+    msg = f"Sent {sent} email(s)."
+    if errors:
+        msg += " Partial errors: " + "; ".join(errors)
+    return {"ok": True, "msg": msg}
 
 
 @app.route("/")
