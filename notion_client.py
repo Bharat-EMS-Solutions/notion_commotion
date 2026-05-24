@@ -1,5 +1,7 @@
 import re
+import time
 import requests
+import concurrent.futures
 from datetime import date, datetime
 
 NOTION_API_VERSION = "2022-06-28"
@@ -23,6 +25,166 @@ _DATE_RE = re.compile(r"Change to(\d{4}-\d{2}-\d{2})")
 
 # Field configs have moved to databases.json.
 # get_task_report() accepts a fields dict loaded from there.
+
+
+def get_users(token: str) -> list[dict]:
+    """Return all human workspace members, sorted by name. Bots excluded."""
+    headers = {"Authorization": f"Bearer {token}", "Notion-Version": NOTION_API_VERSION}
+    users, params = [], {"page_size": 100}
+    while True:
+        resp = requests.get(f"{_BASE_URL}/users", headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        for u in data.get("results", []):
+            if u.get("type") == "person":
+                users.append({"id": u["id"], "name": u.get("name", "(Unknown)")})
+        if not data.get("has_more"):
+            break
+        params["start_cursor"] = data["next_cursor"]
+    return sorted(users, key=lambda u: u["name"].lower())
+
+
+def _page_title(page: dict) -> str:
+    for prop in page.get("properties", {}).values():
+        if prop.get("type") == "title":
+            return "".join(t.get("plain_text", "") for t in prop.get("title", [])).strip()
+    return "".join(t.get("plain_text", "") for t in page.get("title", [])).strip() or "(Untitled)"
+
+
+def _matches(user_obj: dict, user_id: str, user_name: str) -> bool:
+    """Match a Notion user object by ID (exact) or by name (case-insensitive substring)."""
+    if user_id:
+        return user_obj.get("id") == user_id
+    if user_name:
+        return user_name.lower() in user_obj.get("name", "").lower()
+    return False
+
+
+def _user_in_props(props: dict, user_id: str, user_name: str) -> list[str]:
+    """Return names of people-type properties that contain the target user."""
+    return [
+        name for name, prop in props.items()
+        if prop.get("type") == "people"
+        and any(_matches(p, user_id, user_name) for p in prop.get("people", []))
+    ]
+
+
+def _user_in_blocks(blocks: list, user_id: str, user_name: str) -> bool:
+    """True if the target user is @mentioned in any block's rich text."""
+    for block in blocks:
+        content = block.get(block.get("type", ""), {})
+        if not isinstance(content, dict):
+            continue
+        for rt in content.get("rich_text", []):
+            if (rt.get("type") == "mention"
+                    and rt.get("mention", {}).get("type") == "user"
+                    and _matches(rt["mention"]["user"], user_id, user_name)):
+                return True
+    return False
+
+
+def _fmt_last_edited(ts: str) -> str:
+    if not ts:
+        return ""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%d %b %Y, %I:%M %p UTC")
+    except ValueError:
+        return ts
+
+
+def scan_user_mentions(
+    token: str,
+    user_id: str = "",
+    user_name: str = "",
+    check_blocks: bool = False,
+    max_workers: int = 8,
+):
+    """
+    Generator: yields total / progress / result / done events.
+
+    check_blocks=False  — fast, property-check only (data already in search response)
+    check_blocks=True   — also scans @mention blocks, concurrent fetches via thread pool
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    # Collect all accessible pages
+    pages: list[dict] = []
+    payload: dict = {"query": "", "page_size": 100}
+    while True:
+        resp = requests.post(f"{_BASE_URL}/search", headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        payload["start_cursor"] = data["next_cursor"]
+
+    yield {"type": "total", "total": len(pages)}
+
+    if not check_blocks:
+        # Fast path: all data is already in the search response
+        for i, page in enumerate(pages):
+            title = _page_title(page)
+            yield {"type": "progress", "current": i + 1, "title": title}
+            prop_matches = _user_in_props(page.get("properties", {}), user_id, user_name)
+            if prop_matches:
+                yield {
+                    "type":         "result",
+                    "title":        title,
+                    "url":          page.get("url", ""),
+                    "obj_type":     page.get("object", "page"),
+                    "prop_matches": prop_matches,
+                    "block_match":  False,
+                    "last_edited":  _fmt_last_edited(page.get("last_edited_time", "")),
+                }
+        yield {"type": "done"}
+        return
+
+    # Deep path: also fetch blocks, but concurrently
+    def _fetch_blocks(page: dict) -> list:
+        for attempt in range(3):
+            try:
+                r = requests.get(
+                    f"{_BASE_URL}/blocks/{page['id']}/children",
+                    headers=headers, timeout=10,
+                )
+                if r.status_code == 429:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                return r.json().get("results", []) if r.ok else []
+            except Exception:
+                return []
+        return []
+
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {pool.submit(_fetch_blocks, p): p for p in pages}
+        for future in concurrent.futures.as_completed(future_map):
+            page   = future_map[future]
+            title  = _page_title(page)
+            blocks = future.result()
+            completed += 1
+            yield {"type": "progress", "current": completed, "title": title}
+
+            prop_matches = _user_in_props(page.get("properties", {}), user_id, user_name)
+            block_match  = _user_in_blocks(blocks, user_id, user_name)
+
+            if prop_matches or block_match:
+                yield {
+                    "type":         "result",
+                    "title":        title,
+                    "url":          page.get("url", ""),
+                    "obj_type":     page.get("object", "page"),
+                    "prop_matches": prop_matches,
+                    "block_match":  block_match,
+                    "last_edited":  _fmt_last_edited(page.get("last_edited_time", "")),
+                }
+
+    yield {"type": "done"}
 
 
 def _slippage(history_text: str) -> tuple[int, str | None, str | None]:
