@@ -49,17 +49,26 @@ def _page_title(page: dict) -> str:
     return "".join(t.get("plain_text", "") for t in page.get("title", [])).strip() or "(Untitled)"
 
 
-def _user_in_props(props: dict, user_id: str) -> list[str]:
-    """Return names of people-type properties that contain this user."""
+def _matches(user_obj: dict, user_id: str, user_name: str) -> bool:
+    """Match a Notion user object by ID (exact) or by name (case-insensitive substring)."""
+    if user_id:
+        return user_obj.get("id") == user_id
+    if user_name:
+        return user_name.lower() in user_obj.get("name", "").lower()
+    return False
+
+
+def _user_in_props(props: dict, user_id: str, user_name: str) -> list[str]:
+    """Return names of people-type properties that contain the target user."""
     return [
         name for name, prop in props.items()
         if prop.get("type") == "people"
-        and any(p.get("id") == user_id for p in prop.get("people", []))
+        and any(_matches(p, user_id, user_name) for p in prop.get("people", []))
     ]
 
 
-def _user_in_blocks(blocks: list, user_id: str) -> bool:
-    """True if user is @mentioned in any block's rich text."""
+def _user_in_blocks(blocks: list, user_id: str, user_name: str) -> bool:
+    """True if the target user is @mentioned in any block's rich text."""
     for block in blocks:
         content = block.get(block.get("type", ""), {})
         if not isinstance(content, dict):
@@ -67,12 +76,12 @@ def _user_in_blocks(blocks: list, user_id: str) -> bool:
         for rt in content.get("rich_text", []):
             if (rt.get("type") == "mention"
                     and rt.get("mention", {}).get("type") == "user"
-                    and rt.get("mention", {}).get("user", {}).get("id") == user_id):
+                    and _matches(rt["mention"]["user"], user_id, user_name)):
                 return True
     return False
 
 
-def scan_user_mentions(token: str, user_id: str):
+def scan_user_mentions(token: str, user_id: str = "", user_name: str = ""):
     """
     Generator that scans every accessible page for a specific user.
     Yields dicts with type: "total" | "progress" | "result" | "done".
@@ -102,7 +111,7 @@ def scan_user_mentions(token: str, user_id: str):
         title = _page_title(page)
         yield {"type": "progress", "current": i + 1, "title": title}
 
-        prop_matches = _user_in_props(page.get("properties", {}), user_id)
+        prop_matches = _user_in_props(page.get("properties", {}), user_id, user_name)
 
         block_match = False
         try:
@@ -111,7 +120,7 @@ def scan_user_mentions(token: str, user_id: str):
                 headers=headers, timeout=10,
             )
             if r.ok:
-                block_match = _user_in_blocks(r.json().get("results", []), user_id)
+                block_match = _user_in_blocks(r.json().get("results", []), user_id, user_name)
         except Exception:
             pass
 

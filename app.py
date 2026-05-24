@@ -579,12 +579,19 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 <div class="content">
   <div class="card">
     <h2>Select a user to scan for</h2>
-    <p>Scans every page and database accessible to this integration,
-       checking both property assignments and @mentions in content.</p>
+    <p>Scans every accessible page — checks property assignments and @mentions in content.<br>
+       <strong>Guests won't appear in the dropdown</strong> — use the name field below instead.</p>
     <form class="picker-form" method="get" action="/mentions">
-      <select class="user-select" name="user_id" required>
+      <label style="font-size:12px;font-weight:600;color:#374151">Workspace member</label>
+      <select class="user-select" name="user_id">
         {options}
       </select>
+      <div style="text-align:center;font-size:11px;color:#9ca3af">— or —</div>
+      <label style="font-size:12px;font-weight:600;color:#374151">Guest / any name
+        <span style="font-weight:400;color:#9ca3af;margin-left:4px">(case-insensitive, partial match)</span>
+      </label>
+      <input class="user-select" type="text" name="user_name"
+             placeholder="Type display name…" style="cursor:text">
       <button class="scan-btn" type="submit">Scan for mentions →</button>
     </form>
     {no_users}
@@ -600,10 +607,11 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 
 @app.route("/mentions")
 def mentions():
-    user_id = request.args.get("user_id", "").strip()
-    token   = os.environ.get("NOTION_TOKEN", "")
+    user_id   = request.args.get("user_id", "").strip()
+    user_name = request.args.get("user_name", "").strip()
+    token     = os.environ.get("NOTION_TOKEN", "")
 
-    if not user_id:
+    if not user_id and not user_name:
         try:
             users = get_users(token)
         except Exception as exc:
@@ -614,14 +622,17 @@ def mentions():
     def generate():
         yield _MENTIONS_SHELL
 
-        try:
-            users     = get_users(token)
-            user_name = next((u["name"] for u in users if u["id"] == user_id), user_id)
-        except Exception:
-            user_name = user_id
-        yield f'<script>setUserName({json.dumps(user_name)});</script>\n'
+        # Resolve display name for the header
+        display_name = user_name
+        if user_id and not display_name:
+            try:
+                users     = get_users(token)
+                display_name = next((u["name"] for u in users if u["id"] == user_id), user_id)
+            except Exception:
+                display_name = user_id
+        yield f'<script>setUserName({json.dumps(display_name)});</script>\n'
 
-        for event in scan_user_mentions(token, user_id):
+        for event in scan_user_mentions(token, user_id=user_id, user_name=user_name):
             if event["type"] == "total":
                 yield f'<script>setTotal({event["total"]});</script>\n'
             elif event["type"] == "progress":
