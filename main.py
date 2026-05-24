@@ -61,11 +61,12 @@ def load_app_config() -> dict:
     return cfg
 
 
-def load_databases() -> list[tuple[str, dict]]:
+def load_databases() -> list[tuple[str, dict, list[str]]]:
     """
     Read databases.json and resolve each entry's env_var to an actual database ID.
     Entries whose env var is missing are skipped with a warning.
-    Returns [(database_id, fields_dict), ...]
+    Returns [(database_id, fields_dict, recipient_emails), ...]
+    recipient_emails is the DB-level override list (may be empty — caller falls back to global).
     """
     if not _DB_CONFIG_FILE.exists():
         log.error("databases.json not found at %s", _DB_CONFIG_FILE)
@@ -84,8 +85,9 @@ def load_databases() -> list[tuple[str, dict]]:
         if not db_id:
             log.warning("Skipping entry — env var %r is not set", env_var)
             continue
-        fields = entry.get("fields", {})
-        databases.append((db_id, fields))
+        fields     = entry.get("fields", {})
+        recipients = entry.get("recipient_emails", [])
+        databases.append((db_id, fields, recipients))
 
     if not databases:
         log.error("No databases resolved. Check databases.json and .env.")
@@ -115,7 +117,7 @@ def main() -> None:
     )
 
     failed = False
-    for db_id, fields in databases:
+    for db_id, fields, db_recipients in databases:
         log.info("Querying %s...", db_id)
         try:
             report = get_task_report(
@@ -139,8 +141,10 @@ def main() -> None:
             len(report["max_slippage"]),
         )
 
+        recipients = db_recipients or mail_kwargs["recipient_emails"]
+        log.info("[%s] Sending to %d recipient(s)...", report["db_name"], len(recipients))
         try:
-            send_reminder_email(**mail_kwargs, report=report)
+            send_reminder_email(**{**mail_kwargs, "recipient_emails": recipients}, report=report)
             log.info("[%s] Email sent.", report["db_name"])
         except Exception as exc:
             log.error("Failed to send email for %s: %s", report["db_name"], exc)

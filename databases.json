@@ -1,6 +1,7 @@
 [
   {
     "env_var": "NOTION_DATABASE_ID",
+    "recipient_emails": [],
     "fields": {
       "title":       "Task name",
       "due_date":    "Task Due date",
@@ -19,6 +20,7 @@
   },
   {
     "env_var": "NOTION_DATABASE_2_ID",
+    "recipient_emails": [],
     "fields": {
       "title":       "Task name",
       "due_date":    "Due date",
