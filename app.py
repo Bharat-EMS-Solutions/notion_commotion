@@ -12,7 +12,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask, Response, request, stream_with_context
-from markupsafe import Markup
+
 from datetime import datetime, timezone, timedelta
 
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -748,7 +748,7 @@ def send_report():
     msg = f"Sent {sent} email(s)."
     if errors:
         msg += " Partial errors: " + "; ".join(errors)
-    return {"ok": True, "msg": msg}
+    return {"ok": True, "msg": msg}, 200
 
 
 @app.route("/")
