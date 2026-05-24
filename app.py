@@ -87,58 +87,23 @@ def _task_row_html(task: dict, section_key: str, color: str, indented: bool) -> 
     )
 
 
-def _render_report_html(reports: list, active_idx: int) -> str:
-    report     = reports[active_idx]
-    today      = date.today().strftime("%B %d, %Y")
-    fetched_at = datetime.now(_IST).strftime("%d %b %Y, %I:%M %p IST")
-    db_name    = report["db_name"]
-    total   = report["total_open"]
 
+def _render_sections(report: dict) -> str:
+    """Render stat bar + sections for one report (no topbar)."""
     active_sections = [
         (k, l, c, d) for k, l, c, d in _ALL_SECTIONS
         if report.get(k) is not None
     ]
-
-    # ---- top bar ----
-    tabs_html = ""
-    if len(reports) > 1:
-        tabs = "".join(
-            f'<a href="?db={i}" class="db-tab {"active" if i == active_idx else ""}">'
-            f'{r["db_name"]}</a>'
-            for i, r in enumerate(reports)
-        )
-        tabs_html = f'<div class="db-tabs">{tabs}</div>'
-
-    topbar = (
-        f'<div class="topbar">'
-        f'<div>'
-        f'<div class="topbar-label">Task Health Report</div>'
-        f'<h1>{db_name}</h1>'
-        f'<div class="topbar-meta">{today} &nbsp;·&nbsp; {total} open tasks'
-        f' &nbsp;·&nbsp; Last fetched: {fetched_at}</div>'
-        f'</div>'
-        f'<a href="?db={active_idx}" class="refresh-btn">↺ Refresh</a>'
-        f'</div>'
-        f'{tabs_html}'
-    )
-
-    # ---- stat bar ----
     stats = "".join(
-        f'<div class="stat-card">'
-        f'<div class="stat-num" style="color:{c}">{len(report[k])}</div>'
-        f'<div class="stat-lbl">{l}</div>'
-        f'</div>'
+        f'<div class="stat-card"><div class="stat-num" style="color:{c}">{len(report[k])}</div>'
+        f'<div class="stat-lbl">{l}</div></div>'
         for k, l, c, _ in active_sections
     )
-    stat_bar = f'<div class="stat-bar">{stats}</div>'
-
-    # ---- sections ----
     sections_html = ""
     for key, label, color, desc in active_sections:
         tasks = report[key]
         badge_color = color if tasks else "#10b981"
         badge = f'<span class="badge" style="background:{badge_color}">{len(tasks)}</span>'
-
         if not tasks:
             body = '<div class="empty">✓ All clear</div>'
         else:
@@ -147,37 +112,80 @@ def _render_report_html(reports: list, active_idx: int) -> str:
                 proj_total = len(direct) + sum(len(pg[2]) for pg in parent_groups)
                 proj_link = f'<a href="{proj_url}" target="_blank">{proj_name}</a>' if proj_url else proj_name
                 rows.append(
-                    f'<div class="proj-header" style="--color:{color}">'
+                    f'<div class="proj-header" style="--color:{color}" onclick="toggleGroup(this)">'
                     f'{proj_link}'
-                    f'<span class="badge" style="background:{color};font-size:10px;margin-left:8px">{proj_total}</span>'
+                    f'<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'
+                    f'<span class="badge" style="background:{color};font-size:10px">{proj_total}</span>'
+                    f'<span class="toggle-icon">▼</span>'
+                    f'</div>'
                     f'</div>'
                 )
+                rows.append('<div class="proj-body">')
                 for t in direct:
                     rows.append(_task_row_html(t, key, color, False))
                 for par_name, par_url, par_tasks in parent_groups:
                     par_link = f'<a href="{par_url}" target="_blank">{par_name}</a>' if par_url else par_name
                     rows.append(
-                        f'<div class="parent-header">'
-                        f'↳ {par_link}'
-                        f'<span class="parent-count">({len(par_tasks)})</span>'
+                        f'<div class="parent-header" onclick="toggleGroup(this)">'
+                        f'<span>↳ {par_link}<span class="parent-count"> ({len(par_tasks)})</span></span>'
+                        f'<span class="toggle-icon">▼</span>'
                         f'</div>'
                     )
+                    rows.append('<div class="parent-body">')
                     for t in par_tasks:
                         rows.append(_task_row_html(t, key, color, True))
+                    rows.append('</div>')
+                rows.append('</div>')
             body = "".join(rows)
-
         sections_html += (
             f'<div class="section" style="--color:{color}">'
             f'<div class="section-header" onclick="toggleSection(this)">'
             f'<div><h2>{label}</h2><span class="section-desc">{desc}</span></div>'
             f'<div style="display:flex;align-items:center;gap:10px">{badge}'
             f'<span class="toggle-icon" style="transform:rotate(-90deg)">▼</span></div>'
-            f'</div>'
-            f'<div class="section-body collapsed">{body}</div>'
-            f'</div>'
+            f'</div><div class="section-body collapsed">{body}</div></div>'
         )
+    return f'<div class="stat-bar">{stats}</div>{sections_html}'
 
-    return topbar + f'<div class="content">{stat_bar}{sections_html}</div>'
+
+def _render_report_html(reports: list, active_idx: int) -> str:
+    """Full page: topbar + JS-switched panels. No reload on tab click."""
+    today      = date.today().strftime("%B %d, %Y")
+    fetched_at = datetime.now(_IST).strftime("%d %b %Y, %I:%M %p IST")
+
+    topbar = (
+        f'<div class="topbar">'
+        f'<div>'
+        f'<div class="topbar-label">Task Health Report</div>'
+        f'<h1 id="topbar-title">{reports[active_idx]["db_name"]}</h1>'
+        f'<div class="topbar-meta">'
+        f'{today} &nbsp;·&nbsp; '
+        f'<span id="topbar-total">{reports[active_idx]["total_open"]}</span> open tasks'
+        f' &nbsp;·&nbsp; Last fetched: {fetched_at}'
+        f'</div></div>'
+        f'<a href="/" class="refresh-btn">↺ Refresh</a>'
+        f'</div>'
+    )
+
+    tabs_html = ""
+    if len(reports) > 1:
+        tabs = "".join(
+            f'<button class="db-tab {"active" if i == active_idx else ""}" onclick="switchTab({i})">'
+            f'{r["db_name"]}</button>'
+            for i, r in enumerate(reports)
+        )
+        tabs_html = f'<div class="db-tabs">{tabs}</div>'
+
+    panels = "".join(
+        f'<div class="db-panel" id="panel-{i}" '
+        f'data-name="{r["db_name"]}" data-total="{r["total_open"]}" '
+        f'style="{"display:block" if i == active_idx else "display:none"}">'
+        f'{_render_sections(r)}</div>'
+        for i, r in enumerate(reports)
+    )
+
+    return topbar + tabs_html + f'<div class="content">{panels}</div>'
+
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +236,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 .refresh-btn:hover{background:#4b5563}
 .db-tabs{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 32px;display:flex}
 .db-tab{padding:14px 20px;font-size:13px;font-weight:600;cursor:pointer;
-        border-bottom:3px solid transparent;color:#6b7280;text-decoration:none}
+        border:none;border-bottom:3px solid transparent;background:none;
+        color:#6b7280;font-family:inherit;text-decoration:none;outline:none}
 .db-tab.active{color:#111827;border-bottom-color:#111827}
 .db-tab:hover:not(.active){color:#374151}
 .content{padding:28px 32px;max-width:1400px}
@@ -251,14 +260,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
        font-size:11px;font-weight:700;white-space:nowrap}
 .proj-header{padding:8px 20px;background:#f9fafb;border-bottom:1px solid #e5e7eb;
              border-left:4px solid var(--color);display:flex;align-items:center;
-             font-size:13px;font-weight:700}
+             justify-content:space-between;font-size:13px;font-weight:700;
+             cursor:pointer;user-select:none}
 .proj-header a{color:#111827;text-decoration:none}
 .proj-header a:hover{text-decoration:underline}
+.proj-body.collapsed{display:none}
 .parent-header{padding:6px 20px 6px 36px;background:#fafafa;
-               border-bottom:1px solid #f3f4f6;font-size:12px;font-weight:600;color:#374151}
+               border-bottom:1px solid #f3f4f6;font-size:12px;font-weight:600;color:#374151;
+               display:flex;align-items:center;justify-content:space-between;
+               cursor:pointer;user-select:none}
 .parent-header a{color:#374151;text-decoration:none}
 .parent-header a:hover{text-decoration:underline}
 .parent-count{color:#9ca3af;font-weight:400;margin-left:4px}
+.parent-body.collapsed{display:none}
 .task-row{display:flex;align-items:flex-start;padding:10px 20px;
           border-bottom:1px solid #f3f4f6;border-left:3px solid var(--color);gap:12px}
 .task-row.indented{padding-left:44px}
@@ -309,7 +323,22 @@ function showReport(html) {
     }, 400);
   }, 200);
 }
+function switchTab(i) {
+  var panels = document.querySelectorAll('.db-panel');
+  var tabs   = document.querySelectorAll('.db-tab');
+  panels.forEach(function(p, idx) { p.style.display = idx === i ? 'block' : 'none'; });
+  tabs.forEach(function(t, idx)   { t.classList.toggle('active', idx === i); });
+  var panel = document.getElementById('panel-' + i);
+  document.getElementById('topbar-title').textContent  = panel.dataset.name;
+  document.getElementById('topbar-total').textContent = panel.dataset.total;
+}
 function toggleSection(header) {
+  var body = header.nextElementSibling;
+  var icon = header.querySelector('.toggle-icon');
+  var collapsed = body.classList.toggle('collapsed');
+  icon.style.transform = collapsed ? 'rotate(-90deg)' : 'rotate(0deg)';
+}
+function toggleGroup(header) {
   var body = header.nextElementSibling;
   var icon = header.querySelector('.toggle-icon');
   var collapsed = body.classList.toggle('collapsed');
@@ -362,7 +391,8 @@ def index():
         yield '<script>setProgress(92, "Rendering report...");</script>\n'
         safe_idx = min(active_idx, len(reports) - 1)
         html = _render_report_html(reports, safe_idx)
-        yield f'<script>showReport({json.dumps(html)});</script>\n'
+        safe_json = json.dumps(html).replace("</", "<\\/")
+        yield f'<script>showReport({safe_json});</script>\n'
         yield '</body></html>'
 
     return Response(stream_with_context(generate()), mimetype="text/html")
