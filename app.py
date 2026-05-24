@@ -508,9 +508,12 @@ function setUserName(n){
   document.getElementById('user-name').textContent=n;
   document.title='Scanning: '+n;
 }
+var _mode='';
+function setMode(m){ _mode=m; }
 function setTotal(n){
   _total=n;
-  document.getElementById('scan-status').textContent='Scanning 0 of '+n+' pages…';
+  document.getElementById('scan-status').textContent=
+    'Scanning 0 of '+n+' pages'+(_mode?' ('+_mode+')':'')+' …';
 }
 function onProgress(n,title){
   document.getElementById('prog').style.width=(_total?n/_total*100:0)+'%';
@@ -615,6 +618,12 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
       </label>
       <input class="user-select" type="text" name="user_name"
              placeholder="Type display name…" style="cursor:text">
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;
+                    font-weight:400;color:#374151;cursor:pointer">
+        <input type="checkbox" name="deep" value="1" style="width:14px;height:14px">
+        Also scan page content for @mentions
+        <span style="color:#9ca3af">(slower — fetches every page's blocks)</span>
+      </label>
       <button class="scan-btn" type="submit">Scan for mentions →</button>
     </form>
     {no_users}
@@ -630,9 +639,10 @@ body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 
 @app.route("/mentions")
 def mentions():
-    user_id   = request.args.get("user_id", "").strip()
-    user_name = request.args.get("user_name", "").strip()
-    token     = os.environ.get("NOTION_TOKEN", "")
+    user_id     = request.args.get("user_id", "").strip()
+    user_name   = request.args.get("user_name", "").strip()
+    check_blocks = request.args.get("deep") == "1"
+    token       = os.environ.get("NOTION_TOKEN", "")
 
     if not user_id and not user_name:
         try:
@@ -654,8 +664,12 @@ def mentions():
             except Exception:
                 display_name = user_id
         yield f'<script>setUserName({json.dumps(display_name)});</script>\n'
+        mode = "properties + blocks" if check_blocks else "properties only"
+        yield f'<script>setMode({json.dumps(mode)});</script>\n'
 
-        for event in scan_user_mentions(token, user_id=user_id, user_name=user_name):
+        for event in scan_user_mentions(
+            token, user_id=user_id, user_name=user_name, check_blocks=check_blocks
+        ):
             if event["type"] == "total":
                 yield f'<script>setTotal({event["total"]});</script>\n'
             elif event["type"] == "progress":

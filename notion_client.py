@@ -1,5 +1,7 @@
 import re
+import time
 import requests
+import concurrent.futures
 from datetime import date, datetime
 
 NOTION_API_VERSION = "2022-06-28"
@@ -81,11 +83,27 @@ def _user_in_blocks(blocks: list, user_id: str, user_name: str) -> bool:
     return False
 
 
-def scan_user_mentions(token: str, user_id: str = "", user_name: str = ""):
+def _fmt_last_edited(ts: str) -> str:
+    if not ts:
+        return ""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime("%d %b %Y, %I:%M %p UTC")
+    except ValueError:
+        return ts
+
+
+def scan_user_mentions(
+    token: str,
+    user_id: str = "",
+    user_name: str = "",
+    check_blocks: bool = False,
+    max_workers: int = 8,
+):
     """
-    Generator that scans every accessible page for a specific user.
-    Yields dicts with type: "total" | "progress" | "result" | "done".
-    Checks both people-type properties and @mention blocks on each page.
+    Generator: yields total / progress / result / done events.
+
+    check_blocks=False  — fast, property-check only (data already in search response)
+    check_blocks=True   — also scans @mention blocks, concurrent fetches via thread pool
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -93,7 +111,7 @@ def scan_user_mentions(token: str, user_id: str = "", user_name: str = ""):
         "Content-Type": "application/json",
     }
 
-    # Collect all accessible pages and databases
+    # Collect all accessible pages
     pages: list[dict] = []
     payload: dict = {"query": "", "page_size": 100}
     while True:
@@ -107,40 +125,64 @@ def scan_user_mentions(token: str, user_id: str = "", user_name: str = ""):
 
     yield {"type": "total", "total": len(pages)}
 
-    for i, page in enumerate(pages):
-        title = _page_title(page)
-        yield {"type": "progress", "current": i + 1, "title": title}
+    if not check_blocks:
+        # Fast path: all data is already in the search response
+        for i, page in enumerate(pages):
+            title = _page_title(page)
+            yield {"type": "progress", "current": i + 1, "title": title}
+            prop_matches = _user_in_props(page.get("properties", {}), user_id, user_name)
+            if prop_matches:
+                yield {
+                    "type":         "result",
+                    "title":        title,
+                    "url":          page.get("url", ""),
+                    "obj_type":     page.get("object", "page"),
+                    "prop_matches": prop_matches,
+                    "block_match":  False,
+                    "last_edited":  _fmt_last_edited(page.get("last_edited_time", "")),
+                }
+        yield {"type": "done"}
+        return
 
-        prop_matches = _user_in_props(page.get("properties", {}), user_id, user_name)
+    # Deep path: also fetch blocks, but concurrently
+    def _fetch_blocks(page: dict) -> list:
+        for attempt in range(3):
+            try:
+                r = requests.get(
+                    f"{_BASE_URL}/blocks/{page['id']}/children",
+                    headers=headers, timeout=10,
+                )
+                if r.status_code == 429:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                return r.json().get("results", []) if r.ok else []
+            except Exception:
+                return []
+        return []
 
-        block_match = False
-        try:
-            r = requests.get(
-                f"{_BASE_URL}/blocks/{page['id']}/children",
-                headers=headers, timeout=10,
-            )
-            if r.ok:
-                block_match = _user_in_blocks(r.json().get("results", []), user_id, user_name)
-        except Exception:
-            pass
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {pool.submit(_fetch_blocks, p): p for p in pages}
+        for future in concurrent.futures.as_completed(future_map):
+            page   = future_map[future]
+            title  = _page_title(page)
+            blocks = future.result()
+            completed += 1
+            yield {"type": "progress", "current": completed, "title": title}
 
-        if prop_matches or block_match:
-            last_edited = page.get("last_edited_time", "")
-            if last_edited:
-                try:
-                    dt = datetime.fromisoformat(last_edited.replace("Z", "+00:00"))
-                    last_edited = dt.strftime("%d %b %Y, %I:%M %p UTC")
-                except ValueError:
-                    pass
-            yield {
-                "type":        "result",
-                "title":       title,
-                "url":         page.get("url", ""),
-                "obj_type":    page.get("object", "page"),
-                "prop_matches": prop_matches,
-                "block_match": block_match,
-                "last_edited": last_edited,
-            }
+            prop_matches = _user_in_props(page.get("properties", {}), user_id, user_name)
+            block_match  = _user_in_blocks(blocks, user_id, user_name)
+
+            if prop_matches or block_match:
+                yield {
+                    "type":         "result",
+                    "title":        title,
+                    "url":          page.get("url", ""),
+                    "obj_type":     page.get("object", "page"),
+                    "prop_matches": prop_matches,
+                    "block_match":  block_match,
+                    "last_edited":  _fmt_last_edited(page.get("last_edited_time", "")),
+                }
 
     yield {"type": "done"}
 
