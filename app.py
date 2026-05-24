@@ -163,7 +163,13 @@ def _render_report_html(reports: list, active_idx: int) -> str:
         f'<span id="topbar-total">{reports[active_idx]["total_open"]}</span> open tasks'
         f' &nbsp;·&nbsp; Last fetched: {fetched_at}'
         f'</div></div>'
+        f'<div style="display:flex;align-items:center;gap:8px">'
+        f'<span id="depth-lbl" style="font-size:11px;color:#9ca3af;white-space:nowrap">'
+        f'All collapsed</span>'
+        f'<button id="expand-btn"   onclick="expandStep()"   class="ctrl-btn">Expand +</button>'
+        f'<button id="collapse-btn" onclick="collapseStep()" class="ctrl-btn" disabled>Collapse −</button>'
         f'<a href="/" class="refresh-btn">↺ Refresh</a>'
+        f'</div>'
         f'</div>'
     )
 
@@ -232,8 +238,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 .topbar h1{font-size:20px;font-weight:800}
 .topbar-meta{font-size:12px;color:#9ca3af;margin-top:4px}
 .refresh-btn{background:#374151;color:#fff;border:none;border-radius:6px;
-             padding:7px 16px;font-size:12px;cursor:pointer;text-decoration:none}
+             padding:7px 16px;font-size:12px;cursor:pointer;text-decoration:none;
+             font-family:inherit}
 .refresh-btn:hover{background:#4b5563}
+.ctrl-btn{background:#1f2937;color:#d1d5db;border:1px solid #374151;border-radius:6px;
+          padding:7px 12px;font-size:12px;cursor:pointer;font-family:inherit;white-space:nowrap}
+.ctrl-btn:hover:not(:disabled){background:#374151;color:#fff}
+.ctrl-btn:disabled{opacity:.35;cursor:default}
 .db-tabs{background:#fff;border-bottom:1px solid #e5e7eb;padding:0 32px;display:flex}
 .db-tab{padding:14px 20px;font-size:13px;font-weight:600;cursor:pointer;
         border:none;border-bottom:3px solid transparent;background:none;
@@ -308,30 +319,70 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
 
 _SCRIPTS = """
 <script>
-function setProgress(pct, msg) {
-  document.getElementById('prog').style.width = pct + '%';
-  document.getElementById('status').textContent = msg;
+/* ---- Depth control: 0=all collapsed, 1=sections open, 2=+projects, 3=fully expanded ---- */
+var _depth = 0;
+var _DEPTH_LABELS = ['All collapsed', 'Sections open', '+ Projects open', 'Fully expanded'];
+
+function _activePanel() {
+  var panels = document.querySelectorAll('.db-panel');
+  for (var i = 0; i < panels.length; i++) {
+    if (panels[i].style.display !== 'none') return panels[i];
+  }
+  return panels[0];
 }
-function showReport(html) {
-  setProgress(100, 'Done');
-  document.getElementById('app').innerHTML = html;
-  document.getElementById('app').style.display = 'block';
-  setTimeout(function() {
-    document.getElementById('loading').classList.add('done');
-    setTimeout(function() {
-      document.getElementById('loading').style.display = 'none';
-    }, 400);
-  }, 200);
+
+function _applyDepth(panel, d) {
+  function sync(sel, collapsed) {
+    panel.querySelectorAll(sel).forEach(function(body) {
+      body.classList.toggle('collapsed', collapsed);
+      var hdr = body.previousElementSibling;
+      if (hdr) {
+        var icon = hdr.querySelector('.toggle-icon');
+        if (icon) icon.style.transform = collapsed ? 'rotate(-90deg)' : 'rotate(0deg)';
+      }
+    });
+  }
+  sync('.section-body', d < 1);
+  sync('.proj-body',    d < 2);
+  sync('.parent-body',  d < 3);
 }
+
+function _updateDepthBtns() {
+  var cb  = document.getElementById('collapse-btn');
+  var eb  = document.getElementById('expand-btn');
+  var lbl = document.getElementById('depth-lbl');
+  if (cb)  cb.disabled  = _depth <= 0;
+  if (eb)  eb.disabled  = _depth >= 3;
+  if (lbl) lbl.textContent = _DEPTH_LABELS[_depth];
+}
+
+function collapseStep() {
+  if (_depth <= 0) return;
+  _depth--;
+  _applyDepth(_activePanel(), _depth);
+  _updateDepthBtns();
+}
+
+function expandStep() {
+  if (_depth >= 3) return;
+  _depth++;
+  _applyDepth(_activePanel(), _depth);
+  _updateDepthBtns();
+}
+
+/* ---- Tab switching ---- */
 function switchTab(i) {
   var panels = document.querySelectorAll('.db-panel');
   var tabs   = document.querySelectorAll('.db-tab');
   panels.forEach(function(p, idx) { p.style.display = idx === i ? 'block' : 'none'; });
   tabs.forEach(function(t, idx)   { t.classList.toggle('active', idx === i); });
   var panel = document.getElementById('panel-' + i);
-  document.getElementById('topbar-title').textContent  = panel.dataset.name;
+  document.getElementById('topbar-title').textContent = panel.dataset.name;
   document.getElementById('topbar-total').textContent = panel.dataset.total;
+  _applyDepth(panel, _depth);
 }
+
+/* ---- Manual toggles (individual headers) ---- */
 function toggleSection(header) {
   var body = header.nextElementSibling;
   var icon = header.querySelector('.toggle-icon');
@@ -343,6 +394,22 @@ function toggleGroup(header) {
   var icon = header.querySelector('.toggle-icon');
   var collapsed = body.classList.toggle('collapsed');
   icon.style.transform = collapsed ? 'rotate(-90deg)' : 'rotate(0deg)';
+}
+
+/* ---- Loading / report injection ---- */
+function setProgress(pct, msg) {
+  document.getElementById('prog').style.width = pct + '%';
+  document.getElementById('status').textContent = msg;
+}
+function showReport(html) {
+  setProgress(100, 'Done');
+  document.getElementById('app').innerHTML = html;
+  document.getElementById('app').style.display = 'block';
+  _updateDepthBtns();
+  setTimeout(function() {
+    document.getElementById('loading').classList.add('done');
+    setTimeout(function() { document.getElementById('loading').style.display = 'none'; }, 400);
+  }, 200);
 }
 </script>
 """
