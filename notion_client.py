@@ -25,6 +25,117 @@ _DATE_RE = re.compile(r"Change to(\d{4}-\d{2}-\d{2})")
 # get_task_report() accepts a fields dict loaded from there.
 
 
+def get_users(token: str) -> list[dict]:
+    """Return all human workspace members, sorted by name. Bots excluded."""
+    headers = {"Authorization": f"Bearer {token}", "Notion-Version": NOTION_API_VERSION}
+    users, params = [], {"page_size": 100}
+    while True:
+        resp = requests.get(f"{_BASE_URL}/users", headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        for u in data.get("results", []):
+            if u.get("type") == "person":
+                users.append({"id": u["id"], "name": u.get("name", "(Unknown)")})
+        if not data.get("has_more"):
+            break
+        params["start_cursor"] = data["next_cursor"]
+    return sorted(users, key=lambda u: u["name"].lower())
+
+
+def _page_title(page: dict) -> str:
+    for prop in page.get("properties", {}).values():
+        if prop.get("type") == "title":
+            return "".join(t.get("plain_text", "") for t in prop.get("title", [])).strip()
+    return "".join(t.get("plain_text", "") for t in page.get("title", [])).strip() or "(Untitled)"
+
+
+def _user_in_props(props: dict, user_id: str) -> list[str]:
+    """Return names of people-type properties that contain this user."""
+    return [
+        name for name, prop in props.items()
+        if prop.get("type") == "people"
+        and any(p.get("id") == user_id for p in prop.get("people", []))
+    ]
+
+
+def _user_in_blocks(blocks: list, user_id: str) -> bool:
+    """True if user is @mentioned in any block's rich text."""
+    for block in blocks:
+        content = block.get(block.get("type", ""), {})
+        if not isinstance(content, dict):
+            continue
+        for rt in content.get("rich_text", []):
+            if (rt.get("type") == "mention"
+                    and rt.get("mention", {}).get("type") == "user"
+                    and rt.get("mention", {}).get("user", {}).get("id") == user_id):
+                return True
+    return False
+
+
+def scan_user_mentions(token: str, user_id: str):
+    """
+    Generator that scans every accessible page for a specific user.
+    Yields dicts with type: "total" | "progress" | "result" | "done".
+    Checks both people-type properties and @mention blocks on each page.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    # Collect all accessible pages and databases
+    pages: list[dict] = []
+    payload: dict = {"query": "", "page_size": 100}
+    while True:
+        resp = requests.post(f"{_BASE_URL}/search", headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        payload["start_cursor"] = data["next_cursor"]
+
+    yield {"type": "total", "total": len(pages)}
+
+    for i, page in enumerate(pages):
+        title = _page_title(page)
+        yield {"type": "progress", "current": i + 1, "title": title}
+
+        prop_matches = _user_in_props(page.get("properties", {}), user_id)
+
+        block_match = False
+        try:
+            r = requests.get(
+                f"{_BASE_URL}/blocks/{page['id']}/children",
+                headers=headers, timeout=10,
+            )
+            if r.ok:
+                block_match = _user_in_blocks(r.json().get("results", []), user_id)
+        except Exception:
+            pass
+
+        if prop_matches or block_match:
+            last_edited = page.get("last_edited_time", "")
+            if last_edited:
+                try:
+                    dt = datetime.fromisoformat(last_edited.replace("Z", "+00:00"))
+                    last_edited = dt.strftime("%d %b %Y, %I:%M %p UTC")
+                except ValueError:
+                    pass
+            yield {
+                "type":        "result",
+                "title":       title,
+                "url":         page.get("url", ""),
+                "obj_type":    page.get("object", "page"),
+                "prop_matches": prop_matches,
+                "block_match": block_match,
+                "last_edited": last_edited,
+            }
+
+    yield {"type": "done"}
+
+
 def _slippage(history_text: str) -> tuple[int, str | None, str | None]:
     """(days_slipped, original_date, latest_date). History entries are newest-first."""
     dates = _DATE_RE.findall(history_text)

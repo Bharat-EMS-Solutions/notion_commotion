@@ -18,7 +18,7 @@ from datetime import datetime, timezone, timedelta
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 from mailer import _ALL_SECTIONS, _PRIORITY_COLORS, _group_tasks
-from notion_client import get_task_report
+from notion_client import get_task_report, get_users, scan_user_mentions
 
 load_dotenv()
 
@@ -168,6 +168,7 @@ def _render_report_html(reports: list, active_idx: int) -> str:
         f'All collapsed</span>'
         f'<button id="expand-btn"   onclick="expandStep()"   class="ctrl-btn">Expand +</button>'
         f'<button id="collapse-btn" onclick="collapseStep()" class="ctrl-btn" disabled>Collapse −</button>'
+        f'<a href="/mentions" class="refresh-btn">⊕ Mentions</a>'
         f'<a href="/" class="refresh-btn">↺ Refresh</a>'
         f'</div>'
         f'</div>'
@@ -416,8 +417,229 @@ function showReport(html) {
 
 
 # ---------------------------------------------------------------------------
+# Mentions feature
+# ---------------------------------------------------------------------------
+
+_MENTIONS_SHELL = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mentions Scan</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+     background:#f3f4f6;color:#111827;font-size:14px}
+.topbar{background:#111827;color:#fff;padding:18px 32px;
+        display:flex;align-items:center;justify-content:space-between}
+.topbar-label{font-size:11px;font-weight:600;color:#6b7280;
+              text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
+.topbar h1{font-size:20px;font-weight:800}
+.topbar-meta{font-size:12px;color:#9ca3af;margin-top:4px}
+.nav-btn{background:#374151;color:#fff;border:none;border-radius:6px;
+         padding:7px 14px;font-size:12px;cursor:pointer;text-decoration:none;
+         font-family:inherit;white-space:nowrap}
+.nav-btn:hover{background:#4b5563}
+.progress-wrap{height:3px;background:#374151}
+.progress-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);
+               width:0%;transition:width .4s ease}
+.content{padding:28px 32px;max-width:960px}
+.found-bar{font-size:12px;color:#9ca3af;margin-bottom:12px;min-height:18px}
+.mention-card{background:#fff;border-radius:10px;margin-bottom:12px;
+              box-shadow:0 1px 3px rgba(0,0,0,.07);padding:14px 20px;
+              display:flex;align-items:flex-start;gap:12px}
+.mention-main{flex:1;min-width:0}
+.mention-title{font-size:13px;font-weight:600;color:#111827;text-decoration:none;display:block;margin-bottom:6px}
+.mention-title:hover{color:#1d4ed8;text-decoration:underline}
+.mention-tags{display:flex;flex-wrap:wrap;gap:6px}
+.tag{display:inline-block;padding:2px 10px;border-radius:10px;
+     font-size:11px;font-weight:600;white-space:nowrap}
+.tag-prop{background:#dbeafe;color:#1d4ed8}
+.tag-block{background:#f3e8ff;color:#7c3aed}
+.mention-date{font-size:11px;color:#9ca3af;white-space:nowrap;padding-top:2px;min-width:160px;text-align:right}
+.done-msg{font-size:13px;color:#10b981;font-weight:600;margin-top:8px}
+.empty-msg{color:#9ca3af;font-size:13px;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div>
+    <div class="topbar-label">Task Health Report</div>
+    <h1>Scanning for <span id="user-name">…</span></h1>
+    <div class="topbar-meta" id="scan-status">Starting…</div>
+  </div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <a href="/mentions" class="nav-btn">↩ Change user</a>
+    <a href="/" class="nav-btn">Dashboard</a>
+  </div>
+</div>
+<div class="progress-wrap"><div class="progress-fill" id="prog"></div></div>
+<div class="content">
+  <div class="found-bar" id="found-bar"></div>
+  <div id="results"></div>
+</div>
+<script>
+var _total=0, _found=0;
+function setUserName(n){
+  document.getElementById('user-name').textContent=n;
+  document.title='Scanning: '+n;
+}
+function setTotal(n){
+  _total=n;
+  document.getElementById('scan-status').textContent='Scanning 0 of '+n+' pages…';
+}
+function onProgress(n,title){
+  document.getElementById('prog').style.width=(_total?n/_total*100:0)+'%';
+  document.getElementById('scan-status').textContent='Scanning '+n+' of '+_total+': '+title;
+}
+function addResult(html){
+  _found++;
+  document.getElementById('found-bar').textContent=_found+' mention'+(_found!==1?'s':'')+ ' found so far…';
+  document.getElementById('results').insertAdjacentHTML('beforeend',html);
+}
+function onDone(){
+  document.getElementById('prog').style.width='100%';
+  document.getElementById('scan-status').textContent=
+    'Done — scanned '+_total+' pages.';
+  var lbl=_found
+    ?'<span class="done-msg">'+_found+' mention'+(_found!==1?'s':'')+' found.</span>'
+    :'<span class="empty-msg">No mentions found.</span>';
+  document.getElementById('found-bar').innerHTML=lbl;
+}
+</script>
+""" + "<!--" + " " * 4096 + "-->"
+
+
+def _render_mention_card(result: dict) -> str:
+    tags = "".join(
+        f'<span class="tag tag-prop">{p}</span>'
+        for p in result.get("prop_matches", [])
+    )
+    if result.get("block_match"):
+        tags += '<span class="tag tag-block">@mentioned in content</span>'
+    return (
+        f'<div class="mention-card">'
+        f'<div class="mention-main">'
+        f'<a class="mention-title" href="{result["url"]}" target="_blank">{result["title"]}</a>'
+        f'<div class="mention-tags">{tags}</div>'
+        f'</div>'
+        f'<div class="mention-date">{result["last_edited"]}</div>'
+        f'</div>'
+    )
+
+
+def _render_mentions_picker(users: list) -> str:
+    options = '<option value="">— Select a user —</option>' + "".join(
+        f'<option value="{u["id"]}">{u["name"]}</option>'
+        for u in users
+    )
+    no_users = "" if users else '<p style="color:#dc2626;font-size:13px;margin-top:8px">Could not load users — check NOTION_TOKEN.</p>'
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Find Mentions</title>
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+     background:#f3f4f6;color:#111827;font-size:14px}}
+.topbar{{background:#111827;color:#fff;padding:18px 32px;
+        display:flex;align-items:center;justify-content:space-between}}
+.topbar-label{{font-size:11px;font-weight:600;color:#6b7280;
+              text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}}
+.topbar h1{{font-size:20px;font-weight:800}}
+.nav-btn{{background:#374151;color:#fff;border:none;border-radius:6px;
+          padding:7px 14px;font-size:12px;cursor:pointer;text-decoration:none;
+          font-family:inherit}}
+.nav-btn:hover{{background:#4b5563}}
+.content{{padding:28px 32px;max-width:480px}}
+.card{{background:#fff;border-radius:10px;padding:24px;
+       box-shadow:0 1px 3px rgba(0,0,0,.07)}}
+.card h2{{font-size:15px;font-weight:700;margin-bottom:6px}}
+.card p{{font-size:12px;color:#6b7280;margin-bottom:20px;line-height:1.5}}
+.picker-form{{display:flex;flex-direction:column;gap:12px}}
+.user-select{{padding:10px 14px;border:1px solid #d1d5db;border-radius:8px;
+              font-size:14px;font-family:inherit;background:#fff;outline:none}}
+.user-select:focus{{border-color:#6b7280;box-shadow:0 0 0 3px rgba(107,114,128,.12)}}
+.scan-btn{{padding:11px 20px;background:#111827;color:#fff;border:none;border-radius:8px;
+           font-size:14px;font-weight:600;cursor:pointer;font-family:inherit}}
+.scan-btn:hover{{background:#374151}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div>
+    <div class="topbar-label">Task Health Report</div>
+    <h1>Find Mentions</h1>
+  </div>
+  <button onclick="history.length>1?history.back():location.href='/'" class="nav-btn">↩ Dashboard</button>
+</div>
+<div class="content">
+  <div class="card">
+    <h2>Select a user to scan for</h2>
+    <p>Scans every page and database accessible to this integration,
+       checking both property assignments and @mentions in content.</p>
+    <form class="picker-form" method="get" action="/mentions">
+      <select class="user-select" name="user_id" required>
+        {options}
+      </select>
+      <button class="scan-btn" type="submit">Scan for mentions →</button>
+    </form>
+    {no_users}
+  </div>
+</div>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
 # Route
 # ---------------------------------------------------------------------------
+
+@app.route("/mentions")
+def mentions():
+    user_id = request.args.get("user_id", "").strip()
+    token   = os.environ.get("NOTION_TOKEN", "")
+
+    if not user_id:
+        try:
+            users = get_users(token)
+        except Exception as exc:
+            log.error("Failed to fetch users: %s", exc)
+            users = []
+        return _render_mentions_picker(users)
+
+    def generate():
+        yield _MENTIONS_SHELL
+
+        try:
+            users     = get_users(token)
+            user_name = next((u["name"] for u in users if u["id"] == user_id), user_id)
+        except Exception:
+            user_name = user_id
+        yield f'<script>setUserName({json.dumps(user_name)});</script>\n'
+
+        for event in scan_user_mentions(token, user_id):
+            if event["type"] == "total":
+                yield f'<script>setTotal({event["total"]});</script>\n'
+            elif event["type"] == "progress":
+                yield (
+                    f'<script>onProgress({event["current"]},'
+                    f'{json.dumps(event["title"])});</script>\n'
+                )
+            elif event["type"] == "result":
+                card = _render_mention_card(event)
+                safe = json.dumps(card).replace("</", "<\\/")
+                yield f'<script>addResult({safe});</script>\n'
+            elif event["type"] == "done":
+                yield '<script>onDone();</script>\n'
+
+        yield '</body></html>\n'
+
+    return Response(stream_with_context(generate()), mimetype="text/html")
+
 
 @app.route("/")
 def index():
