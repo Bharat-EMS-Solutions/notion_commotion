@@ -4,21 +4,23 @@ once all Notion queries complete. Progress bar updates after each DB query.
 
 Run:  python3 app.py   (then open http://localhost:5000)
 """
+import csv
 import json
 import logging
 import os
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, Response, request, stream_with_context
-
-from datetime import datetime, timezone, timedelta
+from flask import Flask, Response, jsonify, request, stream_with_context
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
-from mailer import _ALL_SECTIONS, _PRIORITY_COLORS, _group_tasks, send_reminder_email
-from notion_client import get_task_report, get_users, scan_user_mentions
+from mailer import (
+    _ALL_SECTIONS, _PRIORITY_COLORS, _group_tasks,
+    build_owner_digest_email, send_reminder_email,
+)
+from notion_client import get_in_progress_tasks_by_owner, get_task_report, get_users, scan_user_mentions
 
 load_dotenv()
 
@@ -795,6 +797,204 @@ def index():
         yield '</body></html>'
 
     return Response(stream_with_context(generate()), mimetype="text/html")
+
+
+_HOURS_LOG = Path(__file__).parent / "hours_log.csv"
+_CSV_HEADER = ["date", "task_id", "task_name", "owner_email", "hours", "logged_at"]
+
+
+def _append_hours(date_str: str, task_id: str, task_name: str,
+                  owner_email: str, hours: float) -> None:
+    write_header = not _HOURS_LOG.exists()
+    with _HOURS_LOG.open("a", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        if write_header:
+            w.writerow(_CSV_HEADER)
+        w.writerow([
+            date_str, task_id, task_name, owner_email,
+            hours,
+            datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+        ])
+
+
+@app.route("/log-hours-action", methods=["POST"])
+def log_hours_action():
+    """
+    Endpoint called by Outlook Actionable Messages when an owner submits hours.
+
+    In dev mode (LOG_HOURS_DEV=true) JWT validation is skipped.
+    In production the Microsoft-signed Bearer JWT must be validated.
+    """
+    dev_mode = os.environ.get("LOG_HOURS_DEV", "true").lower() == "true"
+    owner_email = "unknown"
+
+    if not dev_mode:
+        # Validate Microsoft-signed JWT (implement after provider registration)
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "Missing auth token"}), 401
+        # TODO: decode JWT, verify audience/issuer, extract upn claim
+        # For now we just extract the bearer and trust it (dev only)
+        owner_email = "unverified"
+    else:
+        # In dev mode accept owner_email from body if provided
+        owner_email = request.json.get("owner_email", "dev@local") if request.is_json else "dev@local"
+
+    if not request.is_json:
+        return jsonify({"error": "Expected JSON body"}), 400
+
+    body      = request.json
+    task_id   = body.get("task_id", "")
+    task_name = body.get("task_name", "")
+    date_str  = body.get("date", date.today().strftime("%d %b %Y"))
+
+    try:
+        hours = float(body.get("hours", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid hours value"}), 400
+
+    if hours < 0 or hours > 24:
+        return jsonify({"error": "Hours must be between 0 and 24"}), 400
+
+    _append_hours(date_str, task_id, task_name, owner_email, hours)
+    log.info("Hours logged: %.1f h — %s — %s", hours, task_name, owner_email)
+
+    # Return a replacement MessageCard showing confirmation
+    confirmation_card = {
+        "@type":    "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "summary":  "Hours logged",
+        "themeColor": "10b981",
+        "title":    f"✓ {hours:.1f} h logged for \"{task_name}\"",
+        "text":     f"Logged on {date_str} by {owner_email}.",
+    }
+    return jsonify(confirmation_card), 200
+
+
+@app.route("/preview-digest")
+def preview_digest():
+    """
+    PoC preview: queries Notion for in-progress tasks, groups by owner, and
+    renders a visual preview of what each owner's email + card JSON will look like.
+    """
+    token = os.environ.get("NOTION_TOKEN", "")
+    app_base_url = os.environ.get("APP_BASE_URL", request.host_url.rstrip("/"))
+    today_str    = date.today().strftime("%d %b %Y")
+
+    try:
+        entries = json.loads(_DB_CONFIG_FILE.read_text())
+    except Exception as exc:
+        return f"databases.json error: {exc}", 500
+
+    # Merge in-progress tasks across all configured databases
+    merged: dict[str, dict] = {}
+    errors: list[str] = []
+    for entry in entries:
+        db_id = os.getenv(entry.get("env_var", ""))
+        if not db_id:
+            continue
+        fields  = entry.get("fields", {})
+        db_name = entry.get("env_var", "DB")
+        try:
+            # Fetch DB title from Notion for a friendlier db_name
+            import requests as _req
+            r = _req.get(
+                f"https://api.notion.com/v1/databases/{db_id}",
+                headers={"Authorization": f"Bearer {token}",
+                         "Notion-Version": "2022-06-28"},
+                timeout=10,
+            )
+            if r.ok:
+                db_name = "".join(
+                    t.get("plain_text", "") for t in r.json().get("title", [])
+                ) or db_name
+        except Exception:
+            pass
+
+        try:
+            by_owner = get_in_progress_tasks_by_owner(token, db_id, fields, db_name)
+        except Exception as exc:
+            errors.append(f"{db_name}: {exc}")
+            continue
+
+        for email, info in by_owner.items():
+            if email not in merged:
+                merged[email] = {"owner_name": info["owner_name"], "tasks": []}
+            merged[email]["tasks"].extend(info["tasks"])
+
+    if not merged and not errors:
+        return "<h2 style='font-family:sans-serif;padding:40px'>No in-progress tasks with owner emails found.</h2>"
+
+    # Build preview HTML
+    previews = []
+    for owner_email, info in merged.items():
+        digest  = build_owner_digest_email(
+            owner_name   = info["owner_name"],
+            tasks        = info["tasks"],
+            app_base_url = app_base_url,
+            today_str    = today_str,
+        )
+        card_json = json.dumps(digest["card"], indent=2, ensure_ascii=False)
+        previews.append(f"""
+<section style="max-width:900px;margin:32px auto;font-family:sans-serif;">
+  <h2 style="font-size:16px;color:#374151;">
+    Owner: <strong>{info["owner_name"]}</strong>
+    &lt;{owner_email}&gt; — {len(info["tasks"])} task(s)
+  </h2>
+  <h3 style="font-size:13px;color:#6b7280;margin-bottom:8px;">Email preview (HTML fallback)</h3>
+  <iframe srcdoc="{digest['html'].replace(chr(34), '&quot;')}"
+          style="width:100%;height:420px;border:1px solid #e5e7eb;border-radius:8px;"></iframe>
+  <details style="margin-top:16px;">
+    <summary style="cursor:pointer;font-size:13px;color:#6b7280;">
+      Actionable Message card JSON (embedded in &lt;script type="application/ld+json"&gt;)
+    </summary>
+    <pre style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;
+                padding:16px;font-size:12px;overflow:auto;margin-top:8px;">{card_json}</pre>
+  </details>
+  <details style="margin-top:8px;">
+    <summary style="cursor:pointer;font-size:13px;color:#6b7280;">
+      Test: simulate hours submission (curl command)
+    </summary>
+    <pre style="background:#111827;color:#d1fae5;border-radius:6px;
+                padding:16px;font-size:12px;overflow:auto;margin-top:8px;">{_curl_example(info["tasks"][0], app_base_url, today_str) if info["tasks"] else ""}</pre>
+  </details>
+</section>
+<hr style="border:none;border-top:1px solid #e5e7eb;max-width:900px;margin:0 auto;">
+""")
+
+    error_html = "".join(
+        f'<p style="color:#ef4444;font-family:sans-serif;max-width:900px;margin:8px auto;">⚠ {e}</p>'
+        for e in errors
+    )
+    body_content = error_html + "\n".join(previews)
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Daily Digest Preview</title></head>
+<body style="background:#f3f4f6;padding:24px 0;">
+<div style="max-width:900px;margin:0 auto;font-family:sans-serif;">
+  <h1 style="font-size:20px;color:#111827;">Daily Digest Preview — {today_str}</h1>
+  <p style="font-size:13px;color:#6b7280;">
+    Shows what each owner will receive. Actionable Message cards render interactively
+    in Outlook once the provider is registered (see TODO.md).
+  </p>
+</div>
+{body_content}
+</body></html>"""
+
+
+def _curl_example(task: dict, base_url: str, today_str: str) -> str:
+    payload = json.dumps({
+        "task_id":     task["id"],
+        "task_name":   task["name"],
+        "date":        today_str,
+        "hours":       "3.5",
+        "owner_email": "you@example.com",
+    }, indent=2)
+    return (
+        f"curl -X POST {base_url}/log-hours-action \\\n"
+        f"  -H 'Content-Type: application/json' \\\n"
+        f"  -d '{payload}'"
+    )
 
 
 if __name__ == "__main__":

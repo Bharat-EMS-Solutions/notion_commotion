@@ -292,6 +292,83 @@ def _extract(page: dict, f: dict) -> dict | None:
     }
 
 
+def get_in_progress_tasks_by_owner(
+    token: str, database_id: str, fields: dict, db_name: str
+) -> dict[str, dict]:
+    """
+    Query tasks whose status == fields["in_progress_value"] and group them by owner email.
+
+    Returns {owner_email: {"owner_name": str, "tasks": [task_dict, ...]}}
+    where each task_dict contains: id, name, url, due_date, status, priority, db_name.
+
+    Requires the Notion integration to have "Read user information including email
+    addresses" permission; owners without a resolvable email are skipped.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_API_VERSION,
+        "Content-Type": "application/json",
+    }
+    in_progress = fields.get("in_progress_value", "In progress")
+    payload: dict = {
+        "filter": {
+            "property": fields["status"],
+            "status": {"equals": in_progress},
+        }
+    }
+    url = f"{_BASE_URL}/databases/{database_id}/query"
+    pages: list[dict] = []
+    while True:
+        resp = requests.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        payload["start_cursor"] = data["next_cursor"]
+
+    by_owner: dict[str, dict] = {}
+    for page in pages:
+        props = page.get("properties", {})
+
+        title = "".join(
+            t.get("plain_text", "") for t in props.get(fields["title"], {}).get("title", [])
+        ).strip()
+        if not title or title == "(Untitled)":
+            continue
+
+        due_obj = props.get(fields["due_date"], {}).get("date")
+        due_date = due_obj.get("start") if due_obj else None
+        status_name = props.get(fields["status"], {}).get("status", {}).get("name", "") or ""
+        priority = ""
+        if fields.get("priority"):
+            priority = (props.get(fields["priority"], {}).get("select") or {}).get("name", "")
+
+        task = {
+            "id":       page["id"],
+            "name":     title,
+            "url":      page.get("url", ""),
+            "due_date": due_date,
+            "status":   status_name,
+            "priority": priority,
+            "db_name":  db_name,
+        }
+
+        owner_field = fields.get("owner")
+        if not owner_field:
+            continue
+        for person in props.get(owner_field, {}).get("people", []):
+            email = (person.get("person") or {}).get("email", "")
+            if not email:
+                continue
+            name = person.get("name", email)
+            if email not in by_owner:
+                by_owner[email] = {"owner_name": name, "tasks": []}
+            by_owner[email]["tasks"].append(task)
+
+    return by_owner
+
+
 def get_task_report(token: str, database_id: str, fields: dict) -> dict:
     headers = {
         "Authorization": f"Bearer {token}",

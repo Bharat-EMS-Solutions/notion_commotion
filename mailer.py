@@ -1,3 +1,4 @@
+import json
 from datetime import date
 
 import msal
@@ -296,6 +297,233 @@ def _build_html(report: dict) -> str:
 </td></tr>
 </table>
 </body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# Owner daily digest (Actionable Messages)
+# ---------------------------------------------------------------------------
+
+_PRIORITY_BORDER = {"High": "#ef4444", "Medium": "#f59e0b", "Low": "#10b981"}
+
+
+def _digest_task_row(task: dict) -> str:
+    """HTML fallback row for one in-progress task."""
+    due = task.get("due_date") or "—"
+    pri = task.get("priority", "")
+    border = _PRIORITY_BORDER.get(pri, "#6b7280")
+    pri_badge = (
+        f'<span style="display:inline-block;padding:1px 7px;border-radius:9px;'
+        f'background:{_PRIORITY_COLORS.get(pri,"#9ca3af")};color:#fff;font-size:11px;'
+        f'margin-left:6px;">{pri}</span>'
+    ) if pri else ""
+    db_badge = (
+        f'<span style="display:inline-block;padding:1px 7px;border-radius:9px;'
+        f'background:#e5e7eb;color:#374151;font-size:11px;margin-left:4px;">'
+        f'{task["db_name"]}</span>'
+    )
+    return (
+        f'<tr style="border-bottom:1px solid #f3f4f6;">'
+        f'<td style="padding:10px 14px;border-left:3px solid {border};vertical-align:middle;">'
+        f'<a href="{task["url"]}" style="color:#111827;font-size:13px;font-weight:600;'
+        f'text-decoration:none;">{task["name"]}</a>'
+        f'{pri_badge}{db_badge}'
+        f'</td>'
+        f'<td style="padding:10px 14px;font-size:12px;color:#6b7280;white-space:nowrap;">{due}</td>'
+        f'<td style="padding:10px 14px;font-size:12px;color:#9ca3af;font-style:italic;'
+        f'white-space:nowrap;">Log via Outlook card</td>'
+        f'</tr>'
+    )
+
+
+def _build_digest_html(owner_name: str, tasks: list[dict], today_str: str) -> str:
+    """HTML fallback body for non-Outlook clients."""
+    rows = "\n".join(_digest_task_row(t) for t in tasks)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:24px 0;">
+<tr><td align="center" style="padding:0 12px;">
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="max-width:700px;background:#fff;border-radius:12px;overflow:hidden;
+              box-shadow:0 1px 4px rgba(0,0,0,.08);">
+  <tr>
+    <td style="background:#111827;padding:24px 28px;">
+      <div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;
+                  letter-spacing:.08em;margin-bottom:4px;">Daily Hours Log</div>
+      <div style="font-size:20px;font-weight:800;color:#fff;">Hi {owner_name},</div>
+      <div style="font-size:13px;color:#9ca3af;margin-top:4px;">
+        {today_str} &nbsp;&#183;&nbsp; {len(tasks)} task(s) in progress
+      </div>
+    </td>
+  </tr>
+  <tr><td style="padding:20px 24px;">
+    <p style="font-size:13px;color:#374151;margin:0 0 16px;">
+      Please log your hours for each task below. Open this email in
+      <strong>Outlook</strong> to log hours interactively, or visit each
+      task in Notion directly.
+    </p>
+    <table width="100%" cellpadding="0" cellspacing="0"
+           style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+      <tr style="background:#f9fafb;">
+        <th style="padding:10px 14px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">Task</th>
+        <th style="padding:10px 14px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;width:90px;">Due</th>
+        <th style="padding:10px 14px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;width:130px;">Hours</th>
+      </tr>
+      {rows}
+    </table>
+  </td></tr>
+  <tr>
+    <td style="padding:12px 24px 24px;text-align:center;font-size:11px;color:#9ca3af;">
+      Auto-generated daily digest &mdash; open in Outlook to log hours inline.
+    </td>
+  </tr>
+</table>
+</td></tr>
+</table>
+</body></html>"""
+
+
+def _build_digest_card(
+    owner_name: str,
+    tasks: list[dict],
+    app_base_url: str,
+    today_str: str,
+    originator_id: str = "",
+) -> dict:
+    """
+    Build the Outlook Actionable Message (MessageCard) for the daily digest.
+    Each task gets its own section with a NumberInput ActionCard so the owner
+    can log hours per task independently.
+    """
+    sections = []
+    for task in tasks:
+        due = task.get("due_date") or "No due date"
+        pri = task.get("priority") or "—"
+        facts = [
+            {"name": "Database", "value": task["db_name"]},
+            {"name": "Due",      "value": due},
+            {"name": "Priority", "value": pri},
+        ]
+        # task_id baked into body; hours comes from NumberInput
+        post_body = json.dumps({
+            "task_id":   task["id"],
+            "task_name": task["name"],
+            "date":      today_str,
+            "hours":     "{{hours.value}}",
+        })
+        sections.append({
+            "activityTitle":    f'**{task["name"]}**',
+            "activitySubtitle": task.get("url", ""),
+            "facts":            facts,
+            "potentialAction": [{
+                "@type": "ActionCard",
+                "name":  "Log Hours",
+                "inputs": [{
+                    "@type":      "NumberInput",
+                    "id":         "hours",
+                    "title":      "Hours worked today",
+                    "isRequired": True,
+                }],
+                "actions": [{
+                    "@type":           "HttpPOST",
+                    "name":            "Submit",
+                    "target":          f"{app_base_url}/log-hours-action",
+                    "bodyContentType": "application/json",
+                    "body":            post_body,
+                }],
+            }],
+        })
+
+    card: dict = {
+        "@type":    "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "summary":  f"Daily Hours Log — {today_str}",
+        "themeColor": "111827",
+        "title":    f"Daily Hours Log — {owner_name} — {today_str}",
+        "text":     f"You have **{len(tasks)}** in-progress task(s) today. Log your hours below.",
+        "sections": sections,
+    }
+    if originator_id:
+        card["originator"] = originator_id
+
+    return card
+
+
+def build_owner_digest_email(
+    owner_name: str,
+    tasks: list[dict],
+    app_base_url: str,
+    today_str: str,
+    originator_id: str = "",
+) -> dict:
+    """
+    Returns {"subject": str, "html": str, "card": dict} for one owner's digest.
+
+    The email HTML embeds the card JSON in a <script type="application/ld+json">
+    block so Outlook renders the interactive card; other clients see the HTML table.
+    """
+    card = _build_digest_card(owner_name, tasks, app_base_url, today_str, originator_id)
+    html_body = _build_digest_html(owner_name, tasks, today_str)
+
+    # Embed the card into the HTML via ld+json so Outlook picks it up
+    card_script = (
+        '<script type="application/ld+json">'
+        + json.dumps(card, ensure_ascii=False)
+        + '</script>'
+    )
+    html_with_card = html_body.replace("</head>", card_script + "\n</head>", 1)
+
+    return {
+        "subject": f"Daily Hours Log — {today_str} ({len(tasks)} task(s))",
+        "html":    html_with_card,
+        "card":    card,
+    }
+
+
+def send_owner_daily_digests(
+    tenant_id: str,
+    client_id: str,
+    client_secret: str,
+    sender_email: str,
+    owner_map: dict[str, dict],
+    app_base_url: str,
+    originator_id: str = "",
+) -> list[str]:
+    """
+    Send one digest email per owner in owner_map.
+    owner_map: {email: {"owner_name": str, "tasks": [...]}}
+    Returns list of error strings (empty = all sent successfully).
+    """
+    token     = _acquire_token(tenant_id, client_id, client_secret)
+    today_str = date.today().strftime("%d %b %Y")
+    errors: list[str] = []
+
+    for owner_email, info in owner_map.items():
+        digest = build_owner_digest_email(
+            owner_name    = info["owner_name"],
+            tasks         = info["tasks"],
+            app_base_url  = app_base_url,
+            today_str     = today_str,
+            originator_id = originator_id,
+        )
+        payload = {
+            "message": {
+                "subject": digest["subject"],
+                "body": {"contentType": "HTML", "content": digest["html"]},
+                "toRecipients": [{"emailAddress": {"address": owner_email}}],
+            }
+        }
+        try:
+            resp = requests.post(
+                _GRAPH_SEND_MAIL.format(sender=sender_email),
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            errors.append(f"{owner_email}: {exc}")
+
+    return errors
 
 
 def send_reminder_email(
