@@ -1012,24 +1012,33 @@ def log_hours_action():
     if not entries:
         return jsonify({"error": "No task hours found in submission"}), 400
 
-    # Resolve recipient — in dev mode fall back to sender for testability
-    recipient = owner_email if "@" in owner_email else json.loads(
+    # Resolve recipient — fall back to sender when owner_email is a placeholder
+    # (dev@local passes the "@" check but has no dot in the domain)
+    def _valid_email(addr: str) -> bool:
+        parts = addr.split("@")
+        return len(parts) == 2 and "." in parts[1]
+
+    recipient = owner_email if _valid_email(owner_email) else json.loads(
         _APP_CONFIG_FILE.read_text()
-    ).get("sender_email", owner_email)
+    ).get("sender_email", "")
+    if not recipient:
+        log.warning("No valid recipient for confirmation email, skipping.")
+
 
     try:
         all_rows, daily_total = _upsert_hours(date_str, entries, owner_email)
     except ValueError as exc:
         log.warning("Daily cap exceeded: %s", exc)
-        _send_confirmation_async(
-            recipient_email = recipient,
-            outcome         = "cap_exceeded",
-            entries         = entries,
-            daily_total     = 0,
-            daily_cap       = _DAILY_CAP,
-            date_str        = date_str,
-            cap_error       = str(exc),
-        )
+        if recipient:
+            _send_confirmation_async(
+                recipient_email = recipient,
+                outcome         = "cap_exceeded",
+                entries         = entries,
+                daily_total     = 0,
+                daily_cap       = _DAILY_CAP,
+                date_str        = date_str,
+                cap_error       = str(exc),
+            )
         return jsonify({
             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
             "type":    "AdaptiveCard",
@@ -1053,14 +1062,15 @@ def log_hours_action():
     log.info("Hours logged: %.1f h across %d task(s) — %s (daily total: %.1f h)",
              total_submitted, len(entries), owner_email, daily_total)
 
-    _send_confirmation_async(
-        recipient_email = recipient,
-        outcome         = "overwrite" if overwrote else "ok",
-        entries         = entries,
-        daily_total     = daily_total,
-        daily_cap       = _DAILY_CAP,
-        date_str        = date_str,
-    )
+    if recipient:
+        _send_confirmation_async(
+            recipient_email = recipient,
+            outcome         = "overwrite" if overwrote else "ok",
+            entries         = entries,
+            daily_total     = daily_total,
+            daily_cap       = _DAILY_CAP,
+            date_str        = date_str,
+        )
 
     summary_lines = "\n\n".join(
         f"**{e['task_name']}**: {e['hours']:.1f} h" for e in entries
