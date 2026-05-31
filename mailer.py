@@ -1,10 +1,15 @@
+import base64
 import json
 from datetime import date
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 import msal
 import requests
 
-_GRAPH_SEND_MAIL = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
+_GRAPH_SEND_MAIL     = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
+_GRAPH_SEND_MIME     = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
 _SCOPES = ["https://graph.microsoft.com/.default"]
 
 # Sections whose report value is None are skipped automatically.
@@ -462,22 +467,44 @@ def build_owner_digest_email(
     The email HTML embeds the card JSON in a <script type="application/ld+json">
     block so Outlook renders the interactive card; other clients see the HTML table.
     """
-    card = _build_digest_card(owner_name, tasks, app_base_url, today_str, originator_id)
+    card      = _build_digest_card(owner_name, tasks, app_base_url, today_str, originator_id)
     html_body = _build_digest_html(owner_name, tasks, today_str)
-
-    # Embed the card into the HTML via ld+json so Outlook picks it up
-    card_script = (
-        '<script type="application/ld+json">'
-        + json.dumps(card, ensure_ascii=False)
-        + '</script>'
-    )
-    html_with_card = html_body.replace("</head>", card_script + "\n</head>", 1)
 
     return {
         "subject": f"Daily Hours Log — {today_str} ({len(tasks)} task(s))",
-        "html":    html_with_card,
+        "html":    html_body,
         "card":    card,
     }
+
+
+def _build_mime_message(
+    sender: str,
+    recipient: str,
+    subject: str,
+    html_body: str,
+    card: dict,
+) -> str:
+    """
+    Build a base64-encoded MIME message with the Actionable Message card as a
+    separate application/ld+json part.  Exchange Online honours this part and
+    renders the interactive card in Outlook; other clients see the HTML body.
+    """
+    msg = MIMEMultipart("mixed")
+    msg["From"]    = sender
+    msg["To"]      = recipient
+    msg["Subject"] = subject
+
+    # HTML fallback body
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    # Actionable Message card — separate MIME part, NOT inside the HTML body
+    card_json = json.dumps(card, ensure_ascii=True).encode("ascii")
+    card_part = MIMEBase("application", "ld+json")
+    card_part.set_payload(base64.b64encode(card_json).decode("ascii"))
+    card_part.add_header("Content-Transfer-Encoding", "base64")
+    msg.attach(card_part)
+
+    return base64.b64encode(msg.as_bytes()).decode("ascii")
 
 
 def send_owner_daily_digests(
@@ -506,18 +533,21 @@ def send_owner_daily_digests(
             today_str     = today_str,
             originator_id = originator_id,
         )
-        payload = {
-            "message": {
-                "subject": digest["subject"],
-                "body": {"contentType": "HTML", "content": digest["html"]},
-                "toRecipients": [{"emailAddress": {"address": owner_email}}],
-            }
-        }
+        raw_mime = _build_mime_message(
+            sender    = sender_email,
+            recipient = owner_email,
+            subject   = digest["subject"],
+            html_body = digest["html"],
+            card      = digest["card"],
+        )
         try:
             resp = requests.post(
                 _GRAPH_SEND_MAIL.format(sender=sender_email),
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                json=payload,
+                headers={
+                    "Authorization":  f"Bearer {token}",
+                    "Content-Type":   "text/plain",
+                },
+                data=raw_mime,
             )
             resp.raise_for_status()
         except Exception as exc:

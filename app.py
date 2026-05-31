@@ -8,9 +8,12 @@ import csv
 import json
 import logging
 import os
+import time
+import urllib.request
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
+import jwt as _jwt
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request, stream_with_context
 
@@ -29,6 +32,68 @@ log = logging.getLogger(__name__)
 
 _DB_CONFIG_FILE  = Path(__file__).parent / "databases.json"
 _APP_CONFIG_FILE = Path(__file__).parent / "config.json"
+
+# ---------------------------------------------------------------------------
+# Actionable Messages JWT validation
+# ---------------------------------------------------------------------------
+_AM_JWKS_URL  = "https://substrate.office.com/sts/common/discovery/keys"
+_AM_ISSUER    = "https://substrate.office.com/sts/"
+_jwks_cache: dict = {"keys": [], "fetched_at": 0}
+
+
+def _get_jwks() -> list:
+    """Return JWKS keys, refreshing the cache at most once per hour."""
+    if time.time() - _jwks_cache["fetched_at"] > 3600:
+        with urllib.request.urlopen(_AM_JWKS_URL, timeout=10) as resp:
+            _jwks_cache["keys"] = json.loads(resp.read()).get("keys", [])
+            _jwks_cache["fetched_at"] = time.time()
+    return _jwks_cache["keys"]
+
+
+def _validate_am_token(auth_header: str, audience: str, originator_id: str) -> str:
+    """
+    Validate an Outlook Actionable Messages Bearer JWT.
+    Returns the submitting user's UPN (email address).
+    Raises ValueError on any validation failure.
+    """
+    if not auth_header.startswith("Bearer "):
+        raise ValueError("Missing Bearer token")
+    token = auth_header[7:]
+
+    kid = _jwt.get_unverified_header(token).get("kid")
+    keys = _get_jwks()
+    pub_key = next(
+        (
+            _jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(k))
+            for k in keys if k.get("kid") == kid
+        ),
+        None,
+    )
+    if pub_key is None:
+        # One retry after cache refresh
+        _jwks_cache["fetched_at"] = 0
+        keys = _get_jwks()
+        pub_key = next(
+            (
+                _jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(k))
+                for k in keys if k.get("kid") == kid
+            ),
+            None,
+        )
+    if pub_key is None:
+        raise ValueError(f"No JWKS key found for kid={kid}")
+
+    payload = _jwt.decode(
+        token,
+        pub_key,
+        algorithms=["RS256"],
+        audience=audience,
+        issuer=_AM_ISSUER,
+    )
+    if payload.get("appid") != originator_id:
+        raise ValueError(f"Token appid {payload.get('appid')!r} does not match originator")
+
+    return payload.get("upn") or payload.get("sub", "unknown")
 
 
 def _load_databases():
@@ -825,19 +890,23 @@ def log_hours_action():
     In dev mode (LOG_HOURS_DEV=true) JWT validation is skipped.
     In production the Microsoft-signed Bearer JWT must be validated.
     """
-    dev_mode = os.environ.get("LOG_HOURS_DEV", "true").lower() == "true"
+    dev_mode = os.environ.get("LOG_HOURS_DEV", "false").lower() == "true"
     owner_email = "unknown"
 
     if not dev_mode:
-        # Validate Microsoft-signed JWT (implement after provider registration)
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return jsonify({"error": "Missing auth token"}), 401
-        # TODO: decode JWT, verify audience/issuer, extract upn claim
-        # For now we just extract the bearer and trust it (dev only)
-        owner_email = "unverified"
+        originator_id = os.environ.get("ACTIONABLE_MSG_ORIGINATOR", "")
+        app_base_url  = os.environ.get("APP_BASE_URL", request.host_url.rstrip("/"))
+        audience      = f"{app_base_url}/log-hours-action"
+        try:
+            owner_email = _validate_am_token(
+                request.headers.get("Authorization", ""),
+                audience,
+                originator_id,
+            )
+        except Exception as exc:
+            log.warning("JWT validation failed: %s", exc)
+            return jsonify({"error": "Unauthorized"}), 401
     else:
-        # In dev mode accept owner_email from body if provided
         owner_email = request.json.get("owner_email", "dev@local") if request.is_json else "dev@local"
 
     if not request.is_json:
