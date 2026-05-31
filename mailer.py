@@ -1,15 +1,10 @@
-import base64
 import json
 from datetime import date
-from email.mime.base import MIMEBase
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
 import msal
 import requests
 
-_GRAPH_SEND_MAIL     = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
-_GRAPH_SEND_MIME     = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
+_GRAPH_SEND_MAIL = "https://graph.microsoft.com/v1.0/users/{sender}/sendMail"
 _SCOPES = ["https://graph.microsoft.com/.default"]
 
 # Sections whose report value is None are skipped automatically.
@@ -548,40 +543,6 @@ def build_owner_digest_email(
         "html":    html_with_card,
         "card":    card,
     }
-
-
-def _build_mime_message(
-    sender: str,
-    recipient: str,
-    subject: str,
-    html_body: str,
-    card: dict,
-) -> str:
-    """
-    Build a base64-encoded MIME message with the Actionable Message card as a
-    separate application/ld+json part.  Exchange Online honours this part and
-    renders the interactive card in Outlook; other clients see the HTML body.
-    """
-    msg = MIMEMultipart("mixed")
-    msg["From"]    = sender
-    msg["To"]      = recipient
-    msg["Subject"] = subject
-
-    # HTML fallback body
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-    # Adaptive Card MIME part — profile parameter is required for Exchange to
-    # recognise this as an Actionable Message entity (not a generic attachment)
-    card_json = json.dumps(card, ensure_ascii=True).encode("ascii")
-    card_part = MIMEBase(
-        "application", "ld+json",
-        profile="https://adaptivecards.io/contexts/action/1.0",
-    )
-    card_part.set_payload(base64.b64encode(card_json).decode("ascii"))
-    card_part.add_header("Content-Transfer-Encoding", "base64")
-    msg.attach(card_part)
-
-    return base64.b64encode(msg.as_bytes()).decode("ascii")
 
 
 def send_owner_daily_digests(

@@ -9,12 +9,9 @@ import json
 import logging
 import os
 import threading
-import time
-import urllib.request
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
-import jwt as _jwt
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request, stream_with_context
 
@@ -34,67 +31,9 @@ log = logging.getLogger(__name__)
 _DB_CONFIG_FILE  = Path(__file__).parent / "databases.json"
 _APP_CONFIG_FILE = Path(__file__).parent / "config.json"
 
-# ---------------------------------------------------------------------------
-# Actionable Messages JWT validation
-# ---------------------------------------------------------------------------
-_AM_JWKS_URL  = "https://substrate.office.com/sts/common/discovery/keys"
-_AM_ISSUER    = "https://substrate.office.com/sts/"
-_jwks_cache: dict = {"keys": [], "fetched_at": 0}
-
-
-def _get_jwks() -> list:
-    """Return JWKS keys, refreshing the cache at most once per hour."""
-    if time.time() - _jwks_cache["fetched_at"] > 3600:
-        with urllib.request.urlopen(_AM_JWKS_URL, timeout=10) as resp:
-            _jwks_cache["keys"] = json.loads(resp.read()).get("keys", [])
-            _jwks_cache["fetched_at"] = time.time()
-    return _jwks_cache["keys"]
-
-
-def _validate_am_token(auth_header: str, audience: str, originator_id: str) -> str:
-    """
-    Validate an Outlook Actionable Messages Bearer JWT.
-    Returns the submitting user's UPN (email address).
-    Raises ValueError on any validation failure.
-    """
-    if not auth_header.startswith("Bearer "):
-        raise ValueError("Missing Bearer token")
-    token = auth_header[7:]
-
-    kid = _jwt.get_unverified_header(token).get("kid")
-    keys = _get_jwks()
-    pub_key = next(
-        (
-            _jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(k))
-            for k in keys if k.get("kid") == kid
-        ),
-        None,
-    )
-    if pub_key is None:
-        # One retry after cache refresh
-        _jwks_cache["fetched_at"] = 0
-        keys = _get_jwks()
-        pub_key = next(
-            (
-                _jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(k))
-                for k in keys if k.get("kid") == kid
-            ),
-            None,
-        )
-    if pub_key is None:
-        raise ValueError(f"No JWKS key found for kid={kid}")
-
-    payload = _jwt.decode(
-        token,
-        pub_key,
-        algorithms=["RS256"],
-        audience=audience,
-        issuer=_AM_ISSUER,
-    )
-    if payload.get("appid") != originator_id:
-        raise ValueError(f"Token appid {payload.get('appid')!r} does not match originator")
-
-    return payload.get("upn") or payload.get("sub", "unknown")
+def _valid_email(addr: str) -> bool:
+    parts = addr.split("@")
+    return len(parts) == 2 and "." in parts[1]
 
 
 def _load_databases():
@@ -905,30 +844,33 @@ def _upsert_hours(
     date_str: str,
     entries: list[dict],   # [{task_id, task_name, hours}]
     owner_email: str,
-) -> tuple[list[dict], float]:
+) -> tuple[float, bool]:
     """
     Overwrite existing rows for the same owner+date+task_id and append new ones.
-    Returns (updated_rows, new_daily_total).
+    Returns (new_daily_total, overwrote).
     Raises ValueError if the daily total would exceed _DAILY_CAP.
     """
-    now_str     = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
-    all_rows    = _read_log()
-    task_ids    = {e["task_id"] for e in entries}
+    now_str  = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    all_rows = _read_log()
+    task_ids = {e["task_id"] for e in entries}
 
-    # Keep all rows that are NOT being overwritten
+    # Detect overwrite before mutating
+    existing_ids = {
+        r["task_id"] for r in all_rows
+        if r["owner_email"] == owner_email and r["date"] == date_str
+    }
+    overwrote = bool(task_ids & existing_ids)
+
     kept = [
         r for r in all_rows
         if not (r["owner_email"] == owner_email
                 and r["date"] == date_str
                 and r["task_id"] in task_ids)
     ]
-
-    # Sum hours already logged today for OTHER tasks
     other_today = sum(
         float(r["hours"]) for r in kept
         if r["owner_email"] == owner_email and r["date"] == date_str
     )
-
     new_total = other_today + sum(e["hours"] for e in entries)
     if new_total > _DAILY_CAP:
         raise ValueError(
@@ -936,19 +878,15 @@ def _upsert_hours(
             f"You already have {other_today:.1f} h logged today."
         )
 
-    new_rows = [
-        {
-            "date":        date_str,
-            "task_id":     e["task_id"],
-            "task_name":   e["task_name"],
-            "owner_email": owner_email,
-            "hours":       e["hours"],
-            "logged_at":   now_str,
-        }
-        for e in entries
-    ]
-    _write_log(kept + new_rows)
-    return kept + new_rows, new_total
+    _write_log(kept + [{
+        "date":        date_str,
+        "task_id":     e["task_id"],
+        "task_name":   e["task_name"],
+        "owner_email": owner_email,
+        "hours":       e["hours"],
+        "logged_at":   now_str,
+    } for e in entries])
+    return new_total, overwrote
 
 
 @app.route("/log-hours-action", methods=["POST"])
@@ -962,22 +900,6 @@ def log_hours_action():
     - Duplicate submissions overwrite the previous entry for that task+date
     - Total hours logged per owner per day must not exceed _DAILY_CAP (12 h)
     """
-    dev_mode    = os.environ.get("LOG_HOURS_DEV", "false").lower() == "true"
-    owner_email = "unknown"
-
-    if not dev_mode:
-        originator_id = os.environ.get("ACTIONABLE_MSG_ORIGINATOR", "")
-        app_base_url  = os.environ.get("APP_BASE_URL", request.host_url.rstrip("/"))
-        try:
-            owner_email = _validate_am_token(
-                request.headers.get("Authorization", ""),
-                f"{app_base_url}/log-hours-action",
-                originator_id,
-            )
-        except Exception as exc:
-            log.warning("JWT validation failed: %s", exc)
-            return jsonify({"error": "Unauthorized"}), 401
-
     try:
         body = request.get_json(force=True, silent=False)
     except Exception:
@@ -985,8 +907,7 @@ def log_hours_action():
     if not body:
         return jsonify({"error": "Expected JSON body"}), 400
 
-    if dev_mode:
-        owner_email = body.get("owner_email", "dev@local")
+    owner_email = body.get("owner_email", "dev@local")
 
     date_str = body.get("date", date.today().strftime("%d %b %Y"))
 
@@ -1012,21 +933,12 @@ def log_hours_action():
     if not entries:
         return jsonify({"error": "No task hours found in submission"}), 400
 
-    # Resolve recipient — fall back to sender when owner_email is a placeholder
-    # (dev@local passes the "@" check but has no dot in the domain)
-    def _valid_email(addr: str) -> bool:
-        parts = addr.split("@")
-        return len(parts) == 2 and "." in parts[1]
-
     recipient = owner_email if _valid_email(owner_email) else json.loads(
         _APP_CONFIG_FILE.read_text()
     ).get("sender_email", "")
-    if not recipient:
-        log.warning("No valid recipient for confirmation email, skipping.")
-
 
     try:
-        all_rows, daily_total = _upsert_hours(date_str, entries, owner_email)
+        daily_total, overwrote = _upsert_hours(date_str, entries, owner_email)
     except ValueError as exc:
         log.warning("Daily cap exceeded: %s", exc)
         if recipient:
@@ -1050,13 +962,6 @@ def log_hours_action():
                 "wrap":   True,
             }],
         }), 200
-
-    # Detect overwrite: any existing row for same owner+date+task was replaced
-    prev_task_ids = {
-        r["task_id"] for r in _read_log()
-        if r["owner_email"] == owner_email and r["date"] == date_str
-    }
-    overwrote = bool({e["task_id"] for e in entries} & prev_task_ids)
 
     total_submitted = sum(e["hours"] for e in entries)
     log.info("Hours logged: %.1f h across %d task(s) — %s (daily total: %.1f h)",
