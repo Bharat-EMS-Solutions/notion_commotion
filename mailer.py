@@ -396,57 +396,102 @@ def _build_digest_card(
     originator_id: str = "",
 ) -> dict:
     """
-    Build the Outlook Actionable Message (MessageCard) for the daily digest.
-    Each task gets its own section with a NumberInput ActionCard so the owner
-    can log hours per task independently.
+    Build an Adaptive Card for the daily digest.
+
+    Uses Action.ShowCard so each task has its own expandable Log Hours button
+    with an independent number input — identical UX to the old MessageCard
+    ActionCard pattern but in the format Exchange Online actually recognises.
     """
-    sections = []
+    # Top-level body: one row per task showing name + metadata
+    body_items = [
+        {
+            "type":   "TextBlock",
+            "size":   "Medium",
+            "weight": "Bolder",
+            "text":   f"Hi {owner_name} — {today_str}",
+            "wrap":   True,
+        },
+        {
+            "type":     "TextBlock",
+            "text":     f"You have **{len(tasks)}** in-progress task(s). "
+                        "Tap **Log Hours** next to each task to record your time.",
+            "wrap":     True,
+            "isSubtle": True,
+            "spacing":  "Small",
+        },
+        {"type": "Separator"},
+    ]
+
     for task in tasks:
         due = task.get("due_date") or "No due date"
         pri = task.get("priority") or "—"
-        facts = [
-            {"name": "Database", "value": task["db_name"]},
-            {"name": "Due",      "value": due},
-            {"name": "Priority", "value": pri},
-        ]
-        # task_id baked into body; hours comes from NumberInput
         post_body = json.dumps({
             "task_id":   task["id"],
             "task_name": task["name"],
             "date":      today_str,
             "hours":     "{{hours.value}}",
-        })
-        sections.append({
-            "activityTitle":    f'**{task["name"]}**',
-            "activitySubtitle": task.get("url", ""),
-            "facts":            facts,
-            "potentialAction": [{
-                "@type": "ActionCard",
-                "name":  "Log Hours",
-                "inputs": [{
-                    "@type":      "NumberInput",
-                    "id":         "hours",
-                    "title":      "Hours worked today",
-                    "isRequired": True,
-                }],
-                "actions": [{
-                    "@type":           "HttpPOST",
-                    "name":            "Submit",
-                    "target":          f"{app_base_url}/log-hours-action",
-                    "bodyContentType": "application/json",
-                    "body":            post_body,
-                }],
-            }],
+        }, ensure_ascii=True)
+
+        # ActionSet inside the container keeps the button on its own line
+        # directly under the task it belongs to
+        body_items.append({
+            "type":      "Container",
+            "spacing":   "Small",
+            "separator": True,
+            "items": [
+                {
+                    "type":   "TextBlock",
+                    "weight": "Bolder",
+                    "text":   task["name"],
+                    "wrap":   True,
+                },
+                {
+                    "type":    "FactSet",
+                    "spacing": "Small",
+                    "facts": [
+                        {"title": "Due",      "value": due},
+                        {"title": "Priority", "value": pri},
+                        {"title": "DB",       "value": task["db_name"]},
+                    ],
+                },
+                {
+                    "type": "ActionSet",
+                    "actions": [{
+                        "type":  "Action.ShowCard",
+                        "title": "Log Hours",
+                        "card": {
+                            "type": "AdaptiveCard",
+                            "body": [{
+                                "type":        "Input.Number",
+                                "id":          "hours",
+                                "label":       f"Hours worked today on \"{task['name']}\"",
+                                "placeholder": "e.g. 2.5",
+                                "value":       "0",
+                                "min":         0,
+                                "max":         24,
+                                "isRequired":  True,
+                            }],
+                            "actions": [{
+                                "type":    "Action.Http",
+                                "title":   "Submit",
+                                "method":  "POST",
+                                "url":     f"{app_base_url}/log-hours-action",
+                                "headers": [{"name": "Content-Type", "value": "application/json"}],
+                                "body":    post_body,
+                            }],
+                        },
+                    }],
+                },
+            ],
         })
 
     card: dict = {
-        "@type":    "MessageCard",
-        "@context": "https://schema.org/extensions",
-        "summary":  f"Daily Hours Log — {today_str}",
-        "themeColor": "111827",
-        "title":    f"Daily Hours Log — {owner_name} — {today_str}",
-        "text":     f"You have **{len(tasks)}** in-progress task(s) today. Log your hours below.",
-        "sections": sections,
+        "$schema":          "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type":             "AdaptiveCard",
+        "version":          "1.2",
+        "hideOriginalBody": True,
+        "body":             body_items,
+        "actions":          [],
     }
     if originator_id:
         card["originator"] = originator_id
@@ -464,15 +509,28 @@ def build_owner_digest_email(
     """
     Returns {"subject": str, "html": str, "card": dict} for one owner's digest.
 
-    The email HTML embeds the card JSON in a <script type="application/ld+json">
-    block so Outlook renders the interactive card; other clients see the HTML table.
+    The Adaptive Card is embedded in the HTML <head> as:
+        <script type="application/adaptivecard+json">...</script>
+    and sent via the Graph API JSON endpoint (not raw MIME).
+    Exchange Online preserves this script tag and renders the interactive
+    card in Outlook; other clients see the HTML table fallback.
     """
     card      = _build_digest_card(owner_name, tasks, app_base_url, today_str, originator_id)
     html_body = _build_digest_html(owner_name, tasks, today_str)
 
+    # Embed card in <head> using the correct script type for Adaptive Cards.
+    # Must be application/adaptivecard+json (NOT application/ld+json which is
+    # legacy MessageCard only). Graph API JSON endpoint preserves this tag.
+    card_script = (
+        '<script type="application/adaptivecard+json">'
+        + json.dumps(card, ensure_ascii=True)
+        + '</script>'
+    )
+    html_with_card = html_body.replace("</head>", card_script + "\n</head>", 1)
+
     return {
         "subject": f"Daily Hours Log — {today_str} ({len(tasks)} task(s))",
-        "html":    html_body,
+        "html":    html_with_card,
         "card":    card,
     }
 
@@ -497,9 +555,13 @@ def _build_mime_message(
     # HTML fallback body
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    # Actionable Message card — separate MIME part, NOT inside the HTML body
+    # Adaptive Card MIME part — profile parameter is required for Exchange to
+    # recognise this as an Actionable Message entity (not a generic attachment)
     card_json = json.dumps(card, ensure_ascii=True).encode("ascii")
-    card_part = MIMEBase("application", "ld+json")
+    card_part = MIMEBase(
+        "application", "ld+json",
+        profile="https://adaptivecards.io/contexts/action/1.0",
+    )
     card_part.set_payload(base64.b64encode(card_json).decode("ascii"))
     card_part.add_header("Content-Transfer-Encoding", "base64")
     msg.attach(card_part)
@@ -533,21 +595,21 @@ def send_owner_daily_digests(
             today_str     = today_str,
             originator_id = originator_id,
         )
-        raw_mime = _build_mime_message(
-            sender    = sender_email,
-            recipient = owner_email,
-            subject   = digest["subject"],
-            html_body = digest["html"],
-            card      = digest["card"],
-        )
+        payload = {
+            "message": {
+                "subject": digest["subject"],
+                "body": {"contentType": "HTML", "content": digest["html"]},
+                "toRecipients": [{"emailAddress": {"address": owner_email}}],
+            }
+        }
         try:
             resp = requests.post(
                 _GRAPH_SEND_MAIL.format(sender=sender_email),
                 headers={
-                    "Authorization":  f"Bearer {token}",
-                    "Content-Type":   "text/plain",
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type":  "application/json",
                 },
-                data=raw_mime,
+                json=payload,
             )
             resp.raise_for_status()
         except Exception as exc:

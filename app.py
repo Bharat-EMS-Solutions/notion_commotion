@@ -909,18 +909,25 @@ def log_hours_action():
     else:
         owner_email = request.json.get("owner_email", "dev@local") if request.is_json else "dev@local"
 
-    if not request.is_json:
+    # Parse body — be lenient about Content-Type since Outlook may send text/plain
+    try:
+        body = request.get_json(force=True, silent=False)
+    except Exception:
+        body = None
+    if not body:
+        log.warning("log-hours-action: unparseable body: %r", raw[:200])
         return jsonify({"error": "Expected JSON body"}), 400
 
-    body      = request.json
     task_id   = body.get("task_id", "")
     task_name = body.get("task_name", "")
     date_str  = body.get("date", date.today().strftime("%d %b %Y"))
 
     try:
-        hours = float(body.get("hours", 0))
+        raw_hours = body.get("hours", 0)
+        hours = float(raw_hours) if raw_hours != "" else 0.0
     except (TypeError, ValueError):
-        return jsonify({"error": "Invalid hours value"}), 400
+        log.warning("log-hours-action: bad hours value %r", body.get("hours"))
+        return jsonify({"error": "Invalid hours value — enter a number between 0 and 24"}), 400
 
     if hours < 0 or hours > 24:
         return jsonify({"error": "Hours must be between 0 and 24"}), 400
