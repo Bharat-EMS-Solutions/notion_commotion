@@ -633,6 +633,106 @@ def send_owner_daily_digests(
     return errors
 
 
+# ---------------------------------------------------------------------------
+# Hours submission confirmation email
+# ---------------------------------------------------------------------------
+
+def send_hours_confirmation(
+    tenant_id: str,
+    client_id: str,
+    client_secret: str,
+    sender_email: str,
+    recipient_email: str,
+    outcome: str,           # "ok" | "overwrite" | "cap_exceeded"
+    entries: list[dict],    # [{task_name, hours}]
+    daily_total: float,
+    daily_cap: float,
+    date_str: str,
+    cap_error: str = "",
+) -> None:
+    """Send a brief confirmation email after a hours submission."""
+    if outcome == "cap_exceeded":
+        subject    = f"⚠ Hours Not Logged — {date_str}"
+        color      = "#ef4444"
+        headline   = "Submission rejected — daily cap exceeded"
+        body_lines = [
+            f'<p style="color:#374151;font-size:13px;margin:0 0 12px;">{cap_error}</p>',
+            f'<p style="color:#6b7280;font-size:12px;margin:0;">',
+            f'Please re-submit with a lower total.',
+            f'</p>',
+        ]
+    else:
+        overwrote  = outcome == "overwrite"
+        subject    = f"✓ Hours {'Updated' if overwrote else 'Logged'} — {date_str}"
+        color      = "#f59e0b" if overwrote else "#10b981"
+        headline   = (
+            "Previous entries updated" if overwrote
+            else f"{sum(e['hours'] for e in entries):.1f} h logged across {len(entries)} task(s)"
+        )
+        rows = "".join(
+            f'<tr style="border-bottom:1px solid #f3f4f6;">'
+            f'<td style="padding:7px 12px;font-size:13px;color:#111827;">{e["task_name"]}</td>'
+            f'<td style="padding:7px 12px;font-size:13px;color:#374151;text-align:right;'
+            f'white-space:nowrap;">{e["hours"]:.1f} h</td>'
+            f'</tr>'
+            for e in entries
+        )
+        cap_pct   = min(int(daily_total / daily_cap * 100), 100)
+        bar_color = "#10b981" if daily_total <= daily_cap * 0.75 else "#f59e0b"
+        body_lines = [
+            f'<table width="100%" cellpadding="0" cellspacing="0"'
+            f' style="border:1px solid #e5e7eb;border-radius:6px;overflow:hidden;margin-bottom:14px;">',
+            f'<tr style="background:#f9fafb;"><th style="padding:8px 12px;text-align:left;'
+            f'font-size:11px;color:#6b7280;font-weight:600;">Task</th>'
+            f'<th style="padding:8px 12px;text-align:right;font-size:11px;color:#6b7280;'
+            f'font-weight:600;width:60px;">Hours</th></tr>',
+            rows,
+            f'</table>',
+            f'<p style="font-size:12px;color:#6b7280;margin:0 0 6px;">',
+            f'Daily total: <strong>{daily_total:.1f} h</strong> / {daily_cap:.0f} h cap</p>',
+            f'<div style="background:#f3f4f6;border-radius:4px;height:6px;overflow:hidden;">',
+            f'<div style="background:{bar_color};width:{cap_pct}%;height:6px;"></div></div>',
+        ]
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:20px 0;">
+<tr><td align="center" style="padding:0 12px;">
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="max-width:480px;background:#fff;border-radius:10px;overflow:hidden;
+              box-shadow:0 1px 4px rgba(0,0,0,.08);">
+  <tr>
+    <td style="background:{color};padding:16px 20px;">
+      <div style="font-size:11px;font-weight:600;color:rgba(255,255,255,.75);
+                  text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px;">
+        Hours Log Confirmation</div>
+      <div style="font-size:16px;font-weight:700;color:#fff;">{headline}</div>
+      <div style="font-size:12px;color:rgba(255,255,255,.8);margin-top:3px;">{date_str}</div>
+    </td>
+  </tr>
+  <tr><td style="padding:16px 20px;">
+    {"".join(body_lines)}
+  </td></tr>
+</table>
+</td></tr>
+</table></body></html>"""
+
+    token = _acquire_token(tenant_id, client_id, client_secret)
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": html},
+            "toRecipients": [{"emailAddress": {"address": recipient_email}}],
+        }
+    }
+    resp = requests.post(
+        _GRAPH_SEND_MAIL.format(sender=sender_email),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json=payload,
+    )
+    resp.raise_for_status()
+
+
 def send_reminder_email(
     tenant_id: str,
     client_id: str,

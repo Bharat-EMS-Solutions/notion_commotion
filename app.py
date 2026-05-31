@@ -8,6 +8,7 @@ import csv
 import json
 import logging
 import os
+import threading
 import time
 import urllib.request
 from datetime import date, datetime, timezone, timedelta
@@ -21,7 +22,7 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 
 from mailer import (
     _ALL_SECTIONS, _PRIORITY_COLORS, _group_tasks,
-    build_owner_digest_email, send_reminder_email,
+    build_owner_digest_email, send_hours_confirmation, send_reminder_email,
 )
 from notion_client import get_in_progress_tasks_by_owner, get_task_report, get_users, scan_user_mentions
 
@@ -864,6 +865,23 @@ def index():
     return Response(stream_with_context(generate()), mimetype="text/html")
 
 
+def _send_confirmation_async(**kwargs) -> None:
+    """Fire-and-forget confirmation email — runs in a daemon thread."""
+    def _send():
+        try:
+            cfg = json.loads(_APP_CONFIG_FILE.read_text())
+            send_hours_confirmation(
+                tenant_id     = os.environ["AZURE_TENANT_ID"],
+                client_id     = os.environ["AZURE_CLIENT_ID"],
+                client_secret = os.environ["AZURE_CLIENT_SECRET"],
+                sender_email  = cfg["sender_email"],
+                **kwargs,
+            )
+        except Exception as exc:
+            log.warning("Confirmation email failed: %s", exc)
+    threading.Thread(target=_send, daemon=True).start()
+
+
 _HOURS_LOG  = Path(__file__).parent / "hours_log.csv"
 _CSV_HEADER = ["date", "task_id", "task_name", "owner_email", "hours", "logged_at"]
 _DAILY_CAP  = 12.0
@@ -994,10 +1012,24 @@ def log_hours_action():
     if not entries:
         return jsonify({"error": "No task hours found in submission"}), 400
 
+    # Resolve recipient — in dev mode fall back to sender for testability
+    recipient = owner_email if "@" in owner_email else json.loads(
+        _APP_CONFIG_FILE.read_text()
+    ).get("sender_email", owner_email)
+
     try:
-        _, daily_total = _upsert_hours(date_str, entries, owner_email)
+        all_rows, daily_total = _upsert_hours(date_str, entries, owner_email)
     except ValueError as exc:
         log.warning("Daily cap exceeded: %s", exc)
+        _send_confirmation_async(
+            recipient_email = recipient,
+            outcome         = "cap_exceeded",
+            entries         = entries,
+            daily_total     = 0,
+            daily_cap       = _DAILY_CAP,
+            date_str        = date_str,
+            cap_error       = str(exc),
+        )
         return jsonify({
             "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
             "type":    "AdaptiveCard",
@@ -1010,9 +1042,25 @@ def log_hours_action():
             }],
         }), 200
 
+    # Detect overwrite: any existing row for same owner+date+task was replaced
+    prev_task_ids = {
+        r["task_id"] for r in _read_log()
+        if r["owner_email"] == owner_email and r["date"] == date_str
+    }
+    overwrote = bool({e["task_id"] for e in entries} & prev_task_ids)
+
     total_submitted = sum(e["hours"] for e in entries)
     log.info("Hours logged: %.1f h across %d task(s) — %s (daily total: %.1f h)",
              total_submitted, len(entries), owner_email, daily_total)
+
+    _send_confirmation_async(
+        recipient_email = recipient,
+        outcome         = "overwrite" if overwrote else "ok",
+        entries         = entries,
+        daily_total     = daily_total,
+        daily_cap       = _DAILY_CAP,
+        date_str        = date_str,
+    )
 
     summary_lines = "\n\n".join(
         f"**{e['task_name']}**: {e['hours']:.1f} h" for e in entries
