@@ -28,30 +28,17 @@ ok "Flask running on port $FLASK_PORT"
 # ── 2. Ensure tunnel is running ──────────────────────────────────────────────
 CF_LOG="/tmp/cf_tunnel.log"
 
-if ! pgrep -f "cloudflared tunnel" >/dev/null; then
-    echo "  Starting Cloudflare tunnel..."
-    > "$CF_LOG"
-    nohup cloudflared tunnel --url "http://localhost:$FLASK_PORT" \
-        --no-autoupdate >"$CF_LOG" 2>&1 &
-    for i in $(seq 1 15); do
-        sleep 2
-        TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$CF_LOG" | tail -1)
-        [ -n "$TUNNEL_URL" ] && break
-    done
+TUNNEL_URL="https://notion-digest.bharatelectrodrives.com"
+
+if ! pgrep -f "cloudflared tunnel run" >/dev/null; then
+    echo "  Starting named tunnel..."
+    nohup cloudflared tunnel run notion-digest >"$CF_LOG" 2>&1 &
+    sleep 4
+    grep -q "Registered tunnel connection" "$CF_LOG" 2>/dev/null \
+        && ok "Tunnel connected" \
+        || warn "Tunnel starting — check $CF_LOG if issues persist"
 else
-    TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | tail -1)
-fi
-
-[ -n "${TUNNEL_URL:-}" ] || err "Could not get tunnel URL — run ./tunnel.sh to diagnose"
-ok "Tunnel live: $TUNNEL_URL"
-
-# Update .env if URL changed
-OLD_URL=$(grep '^APP_BASE_URL=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2- || true)
-if [ "$OLD_URL" != "$TUNNEL_URL" ]; then
-    sed -i "s|^APP_BASE_URL=.*|APP_BASE_URL=$TUNNEL_URL|" "$APP_DIR/.env"
-    echo -e "  ${YELLOW}⚠  Tunnel URL changed — update the OAM provider Target URL:${NC}"
-    echo -e "     https://outlook.office.com/connectors/oam/publish"
-    echo -e "     New URL: ${CYAN}$TUNNEL_URL${NC}"
+    ok "Tunnel already running"
 fi
 
 # ── 3. Send demo email ───────────────────────────────────────────────────────
