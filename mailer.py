@@ -422,68 +422,76 @@ def _build_digest_card(
         {"type": "Separator"},
     ]
 
+    # Build one Input.Number per task (all visible — no ShowCard expansion needed)
+    # Input ID uses the task UUID with dashes so the server can reconstruct the
+    # task_id by stripping the "h_" prefix.  Task names travel as "n_UUID" static
+    # fields so the server can log them without a separate Notion lookup.
+    hours_refs = {}   # {input_id: template_placeholder}
+    name_refs  = {}   # {name_key:  task_name}
+
     for task in tasks:
         due = task.get("due_date") or "No due date"
         pri = task.get("priority") or "—"
-        post_body = json.dumps({
-            "task_id":   task["id"],
-            "task_name": task["name"],
-            "date":      today_str,
-            "hours":     "{{hours.value}}",
-        }, ensure_ascii=True)
+        inp_id   = f"h_{task['id']}"
+        name_key = f"n_{task['id']}"
+        hours_refs[inp_id]  = f"{{{{{inp_id}.value}}}}"
+        name_refs[name_key] = task["name"]
 
-        # ActionSet inside the container keeps the button on its own line
-        # directly under the task it belongs to
         body_items.append({
             "type":      "Container",
             "spacing":   "Small",
             "separator": True,
             "items": [
                 {
-                    "type":   "TextBlock",
-                    "weight": "Bolder",
-                    "text":   task["name"],
-                    "wrap":   True,
-                },
-                {
-                    "type":    "FactSet",
-                    "spacing": "Small",
-                    "facts": [
-                        {"title": "Due",      "value": due},
-                        {"title": "Priority", "value": pri},
-                        {"title": "DB",       "value": task["db_name"]},
-                    ],
-                },
-                {
-                    "type": "ActionSet",
-                    "actions": [{
-                        "type":  "Action.ShowCard",
-                        "title": "Log Hours",
-                        "card": {
-                            "type": "AdaptiveCard",
-                            "body": [{
+                    "type":   "ColumnSet",
+                    "columns": [
+                        {
+                            "type":  "Column",
+                            "width": "stretch",
+                            "items": [
+                                {
+                                    "type":   "TextBlock",
+                                    "weight": "Bolder",
+                                    "text":   task["name"],
+                                    "wrap":   True,
+                                },
+                                {
+                                    "type":    "FactSet",
+                                    "spacing": "Small",
+                                    "facts": [
+                                        {"title": "Due",      "value": due},
+                                        {"title": "Priority", "value": pri},
+                                        {"title": "DB",       "value": task["db_name"]},
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "type":  "Column",
+                            "width": "auto",
+                            "verticalContentAlignment": "Center",
+                            "items": [{
                                 "type":        "Input.Number",
-                                "id":          "hours",
-                                "label":       f"Hours worked today on \"{task['name']}\"",
-                                "placeholder": "e.g. 2.5",
+                                "id":          inp_id,
+                                "label":       "hrs",
+                                "placeholder": "0",
                                 "value":       "0",
                                 "min":         0,
-                                "max":         24,
+                                "max":         12,
                                 "isRequired":  True,
                             }],
-                            "actions": [{
-                                "type":    "Action.Http",
-                                "title":   "Submit",
-                                "method":  "POST",
-                                "url":     f"{app_base_url}/log-hours-action",
-                                "headers": [{"name": "Content-Type", "value": "application/json"}],
-                                "body":    post_body,
-                            }],
                         },
-                    }],
+                    ],
                 },
             ],
         })
+
+    # Single Submit All button at the bottom — body carries all input values
+    # plus static task-name lookup so the server needs no extra API calls
+    post_body = json.dumps(
+        {"date": today_str, **hours_refs, **name_refs},
+        ensure_ascii=True,
+    )
 
     card: dict = {
         "$schema":          "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -491,7 +499,14 @@ def _build_digest_card(
         "version":          "1.2",
         "hideOriginalBody": True,
         "body":             body_items,
-        "actions":          [],
+        "actions": [{
+            "type":    "Action.Http",
+            "title":   "Submit All Hours",
+            "method":  "POST",
+            "url":     f"{app_base_url}/log-hours-action",
+            "headers": [{"name": "Content-Type", "value": "application/json"}],
+            "body":    post_body,
+        }],
     }
     if originator_id:
         card["originator"] = originator_id

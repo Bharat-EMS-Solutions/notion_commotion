@@ -864,87 +864,184 @@ def index():
     return Response(stream_with_context(generate()), mimetype="text/html")
 
 
-_HOURS_LOG = Path(__file__).parent / "hours_log.csv"
+_HOURS_LOG  = Path(__file__).parent / "hours_log.csv"
 _CSV_HEADER = ["date", "task_id", "task_name", "owner_email", "hours", "logged_at"]
+_DAILY_CAP  = 12.0
 
 
-def _append_hours(date_str: str, task_id: str, task_name: str,
-                  owner_email: str, hours: float) -> None:
-    write_header = not _HOURS_LOG.exists()
-    with _HOURS_LOG.open("a", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        if write_header:
-            w.writerow(_CSV_HEADER)
-        w.writerow([
-            date_str, task_id, task_name, owner_email,
-            hours,
-            datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-        ])
+def _read_log() -> list[dict]:
+    if not _HOURS_LOG.exists():
+        return []
+    with _HOURS_LOG.open(newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
+def _write_log(rows: list[dict]) -> None:
+    with _HOURS_LOG.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=_CSV_HEADER)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def _upsert_hours(
+    date_str: str,
+    entries: list[dict],   # [{task_id, task_name, hours}]
+    owner_email: str,
+) -> tuple[list[dict], float]:
+    """
+    Overwrite existing rows for the same owner+date+task_id and append new ones.
+    Returns (updated_rows, new_daily_total).
+    Raises ValueError if the daily total would exceed _DAILY_CAP.
+    """
+    now_str     = datetime.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    all_rows    = _read_log()
+    task_ids    = {e["task_id"] for e in entries}
+
+    # Keep all rows that are NOT being overwritten
+    kept = [
+        r for r in all_rows
+        if not (r["owner_email"] == owner_email
+                and r["date"] == date_str
+                and r["task_id"] in task_ids)
+    ]
+
+    # Sum hours already logged today for OTHER tasks
+    other_today = sum(
+        float(r["hours"]) for r in kept
+        if r["owner_email"] == owner_email and r["date"] == date_str
+    )
+
+    new_total = other_today + sum(e["hours"] for e in entries)
+    if new_total > _DAILY_CAP:
+        raise ValueError(
+            f"Total would be {new_total:.1f} h — daily cap is {_DAILY_CAP:.0f} h. "
+            f"You already have {other_today:.1f} h logged today."
+        )
+
+    new_rows = [
+        {
+            "date":        date_str,
+            "task_id":     e["task_id"],
+            "task_name":   e["task_name"],
+            "owner_email": owner_email,
+            "hours":       e["hours"],
+            "logged_at":   now_str,
+        }
+        for e in entries
+    ]
+    _write_log(kept + new_rows)
+    return kept + new_rows, new_total
 
 
 @app.route("/log-hours-action", methods=["POST"])
 def log_hours_action():
     """
     Endpoint called by Outlook Actionable Messages when an owner submits hours.
+    Accepts a batch submission: body contains h_TASKID keys for hours and
+    n_TASKID keys for task names, plus a date field.
 
-    In dev mode (LOG_HOURS_DEV=true) JWT validation is skipped.
-    In production the Microsoft-signed Bearer JWT must be validated.
+    Rules enforced:
+    - Duplicate submissions overwrite the previous entry for that task+date
+    - Total hours logged per owner per day must not exceed _DAILY_CAP (12 h)
     """
-    dev_mode = os.environ.get("LOG_HOURS_DEV", "false").lower() == "true"
+    dev_mode    = os.environ.get("LOG_HOURS_DEV", "false").lower() == "true"
     owner_email = "unknown"
 
     if not dev_mode:
         originator_id = os.environ.get("ACTIONABLE_MSG_ORIGINATOR", "")
         app_base_url  = os.environ.get("APP_BASE_URL", request.host_url.rstrip("/"))
-        audience      = f"{app_base_url}/log-hours-action"
         try:
             owner_email = _validate_am_token(
                 request.headers.get("Authorization", ""),
-                audience,
+                f"{app_base_url}/log-hours-action",
                 originator_id,
             )
         except Exception as exc:
             log.warning("JWT validation failed: %s", exc)
             return jsonify({"error": "Unauthorized"}), 401
-    else:
-        owner_email = request.json.get("owner_email", "dev@local") if request.is_json else "dev@local"
 
-    # Parse body — be lenient about Content-Type since Outlook may send text/plain
     try:
         body = request.get_json(force=True, silent=False)
     except Exception:
         body = None
     if not body:
-        log.warning("log-hours-action: unparseable body: %r", raw[:200])
         return jsonify({"error": "Expected JSON body"}), 400
 
-    task_id   = body.get("task_id", "")
-    task_name = body.get("task_name", "")
-    date_str  = body.get("date", date.today().strftime("%d %b %Y"))
+    if dev_mode:
+        owner_email = body.get("owner_email", "dev@local")
+
+    date_str = body.get("date", date.today().strftime("%d %b %Y"))
+
+    # Extract task entries from h_TASKID / n_TASKID key pairs
+    names = {k[2:]: v for k, v in body.items() if k.startswith("n_")}
+    entries = []
+    for key, val in body.items():
+        if not key.startswith("h_"):
+            continue
+        task_id = key[2:]
+        try:
+            hrs = float(val) if val != "" else 0.0
+        except (TypeError, ValueError):
+            return jsonify({"error": f"Invalid hours for task {task_id}"}), 400
+        if hrs < 0 or hrs > _DAILY_CAP:
+            return jsonify({"error": f"Hours must be between 0 and {_DAILY_CAP:.0f}"}), 400
+        entries.append({
+            "task_id":   task_id,
+            "task_name": names.get(task_id, task_id),
+            "hours":     hrs,
+        })
+
+    if not entries:
+        return jsonify({"error": "No task hours found in submission"}), 400
 
     try:
-        raw_hours = body.get("hours", 0)
-        hours = float(raw_hours) if raw_hours != "" else 0.0
-    except (TypeError, ValueError):
-        log.warning("log-hours-action: bad hours value %r", body.get("hours"))
-        return jsonify({"error": "Invalid hours value — enter a number between 0 and 24"}), 400
+        _, daily_total = _upsert_hours(date_str, entries, owner_email)
+    except ValueError as exc:
+        log.warning("Daily cap exceeded: %s", exc)
+        return jsonify({
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type":    "AdaptiveCard",
+            "version": "1.2",
+            "body": [{
+                "type":   "TextBlock",
+                "text":   f"⚠ Cannot log hours: {exc}",
+                "color":  "attention",
+                "wrap":   True,
+            }],
+        }), 200
 
-    if hours < 0 or hours > 24:
-        return jsonify({"error": "Hours must be between 0 and 24"}), 400
+    total_submitted = sum(e["hours"] for e in entries)
+    log.info("Hours logged: %.1f h across %d task(s) — %s (daily total: %.1f h)",
+             total_submitted, len(entries), owner_email, daily_total)
 
-    _append_hours(date_str, task_id, task_name, owner_email, hours)
-    log.info("Hours logged: %.1f h — %s — %s", hours, task_name, owner_email)
-
-    # Return a replacement MessageCard showing confirmation
-    confirmation_card = {
-        "@type":    "MessageCard",
-        "@context": "https://schema.org/extensions",
-        "summary":  "Hours logged",
-        "themeColor": "10b981",
-        "title":    f"✓ {hours:.1f} h logged for \"{task_name}\"",
-        "text":     f"Logged on {date_str} by {owner_email}.",
-    }
-    return jsonify(confirmation_card), 200
+    summary_lines = "\n\n".join(
+        f"**{e['task_name']}**: {e['hours']:.1f} h" for e in entries
+    )
+    return jsonify({
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type":    "AdaptiveCard",
+        "version": "1.2",
+        "body": [
+            {
+                "type":   "TextBlock",
+                "size":   "Medium",
+                "weight": "Bolder",
+                "color":  "good",
+                "text":   f"✓ {total_submitted:.1f} h logged across {len(entries)} task(s)",
+            },
+            {
+                "type": "TextBlock",
+                "text": summary_lines,
+                "wrap": True,
+            },
+            {
+                "type":     "TextBlock",
+                "text":     f"Daily total: **{daily_total:.1f} h** / {_DAILY_CAP:.0f} h cap  •  {date_str}",
+                "isSubtle": True,
+                "wrap":     True,
+            },
+        ],
+    }), 200
 
 
 @app.route("/preview-digest")
