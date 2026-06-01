@@ -1,6 +1,7 @@
 [
   {
     "env_var": "NOTION_DATABASE_ID",
+    "digest": true,
     "recipient_emails": [],
     "fields": {
       "title":              "Task name",
@@ -21,6 +22,7 @@
   },
   {
     "env_var": "NOTION_DATABASE_2_ID",
+    "digest": false,
     "recipient_emails": [],
     "fields": {
       "title":              "Task name",

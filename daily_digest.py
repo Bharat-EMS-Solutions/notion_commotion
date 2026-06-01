@@ -41,6 +41,8 @@ def _load_owner_map(token: str) -> dict[str, dict]:
 
     import requests as _req
     for entry in entries:
+        if not entry.get("digest", False):
+            continue
         db_id = os.getenv(entry.get("env_var", ""))
         if not db_id:
             continue
