@@ -383,6 +383,25 @@ def _build_digest_html(owner_name: str, tasks: list[dict], today_str: str) -> st
 </body></html>"""
 
 
+def _task_facts(task: dict, due: str, pri: str) -> list[dict]:
+    """Build the FactSet rows for one task, including project/parent chain."""
+    facts = []
+    # Breadcrumb: Project › Parent Task
+    crumbs = []
+    if task.get("project"):
+        crumbs.append(task["project"]["name"])
+    if task.get("parent_task"):
+        crumbs.append(task["parent_task"]["name"])
+    if crumbs:
+        facts.append({"title": "Path", "value": " › ".join(crumbs)})
+    facts += [
+        {"title": "Due",      "value": due},
+        {"title": "Priority", "value": pri},
+        {"title": "DB",       "value": task["db_name"]},
+    ]
+    return facts
+
+
 def _build_digest_card(
     owner_name: str,
     tasks: list[dict],
@@ -453,11 +472,7 @@ def _build_digest_card(
                                 {
                                     "type":    "FactSet",
                                     "spacing": "Small",
-                                    "facts": [
-                                        {"title": "Due",      "value": due},
-                                        {"title": "Priority", "value": pri},
-                                        {"title": "DB",       "value": task["db_name"]},
-                                    ],
+                                    "facts":   _task_facts(task, due, pri),
                                 },
                             ],
                         },

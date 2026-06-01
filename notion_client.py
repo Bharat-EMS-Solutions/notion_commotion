@@ -327,7 +327,10 @@ def get_in_progress_tasks_by_owner(
             break
         payload["start_cursor"] = data["next_cursor"]
 
-    by_owner: dict[str, dict] = {}
+    # First pass — extract tasks and collect relation IDs for batch fetch
+    raw_tasks: list[dict] = []
+    relation_ids: set[str] = set()
+
     for page in pages:
         props = page.get("properties", {})
 
@@ -344,26 +347,55 @@ def get_in_progress_tasks_by_owner(
         if fields.get("priority"):
             priority = (props.get(fields["priority"], {}).get("select") or {}).get("name", "")
 
-        task = {
-            "id":       page["id"],
-            "name":     title,
-            "url":      page.get("url", ""),
-            "due_date": due_date,
-            "status":   status_name,
-            "priority": priority,
-            "db_name":  db_name,
-        }
+        proj_rel   = props.get(fields.get("project", "") or "", {}).get("relation", [])
+        parent_rel = props.get(fields.get("parent_task", "") or "", {}).get("relation", [])
+        proj_id    = proj_rel[0]["id"]   if proj_rel   else None
+        parent_id  = parent_rel[0]["id"] if parent_rel else None
+        if proj_id:   relation_ids.add(proj_id)
+        if parent_id: relation_ids.add(parent_id)
 
         owner_field = fields.get("owner")
-        if not owner_field:
-            continue
-        for person in props.get(owner_field, {}).get("people", []):
-            email = (person.get("person") or {}).get("email", "")
-            if not email:
-                continue
-            name = person.get("name", email)
+        owners = []
+        if owner_field:
+            for person in props.get(owner_field, {}).get("people", []):
+                email = (person.get("person") or {}).get("email", "")
+                if email:
+                    owners.append({"email": email, "name": person.get("name", email)})
+
+        raw_tasks.append({
+            "id":        page["id"],
+            "name":      title,
+            "url":       page.get("url", ""),
+            "due_date":  due_date,
+            "status":    status_name,
+            "priority":  priority,
+            "db_name":   db_name,
+            "owners":    owners,
+            "_proj_id":  proj_id,
+            "_par_id":   parent_id,
+        })
+
+    # Batch fetch relation names
+    refs = _fetch_page_refs(relation_ids, headers) if relation_ids else {}
+
+    # Second pass — enrich and group by owner
+    by_owner: dict[str, dict] = {}
+    for raw in raw_tasks:
+        task = {
+            "id":          raw["id"],
+            "name":        raw["name"],
+            "url":         raw["url"],
+            "due_date":    raw["due_date"],
+            "status":      raw["status"],
+            "priority":    raw["priority"],
+            "db_name":     raw["db_name"],
+            "project":     refs.get(raw["_proj_id"])  if raw["_proj_id"]  else None,
+            "parent_task": refs.get(raw["_par_id"])   if raw["_par_id"]   else None,
+        }
+        for owner in raw["owners"]:
+            email = owner["email"]
             if email not in by_owner:
-                by_owner[email] = {"owner_name": name, "tasks": []}
+                by_owner[email] = {"owner_name": owner["name"], "tasks": []}
             by_owner[email]["tasks"].append(task)
 
     return by_owner
