@@ -31,6 +31,16 @@ log = logging.getLogger(__name__)
 _DB_CONFIG_FILE  = Path(__file__).parent / "databases.json"
 _APP_CONFIG_FILE = Path(__file__).parent / "config.json"
 
+# ── Start APScheduler (background thread) — only in the main Flask process ──
+# Flask debug mode spawns a reloader child; we start the scheduler only once.
+_scheduler = None
+if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    try:
+        from scheduler import start_scheduler
+        _scheduler = start_scheduler()
+    except Exception as _sched_exc:
+        log.error("Scheduler failed to start: %s", _sched_exc)
+
 def _valid_email(addr: str) -> bool:
     parts = addr.split("@")
     return len(parts) == 2 and "." in parts[1]
@@ -1133,5 +1143,226 @@ def _curl_example(task: dict, base_url: str, today_str: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# MIS template preview routes  (design sandbox — no Notion queries needed)
+# ---------------------------------------------------------------------------
+
+from mailer import (
+    _build_task_assigned_html,
+    _build_slippage_digest_html,
+    _build_project_started_html,
+    _build_due_soon_html,
+)
+
+# Sample data used for all previews
+_PREVIEW_TASK = {
+    "name":        "Design new motor controller PCB layout",
+    "url":         "#",
+    "due_date":    "2026-06-18",
+    "status":      "In Progress",
+    "priority":    "High",
+    "teams":       ["Electronics", "R&D"],
+    "description": (
+        "Complete the schematic review, finalize component placement, "
+        "and route all high-current traces before handing off to fab."
+    ),
+    "project":     {"name": "Motor Drive Gen-3", "url": "#"},
+    "parent_task": {"name": "PCB Design Phase",  "url": "#"},
+    "db_name":     "Engineering Tasks",
+    "assignees":   [{"name": "Ravi Sharma", "email": "ravi@example.com"}],
+    "team_members": [
+        {"name": "Ravi Sharma"},
+        {"name": "Priya Nair"},
+        {"name": "Amit Patel"},
+    ],
+}
+
+_PREVIEW_SUBTASKS = [
+    {"name": "Schematic review",           "url": "#",
+     "status": "Done",        "due_date": "2026-06-10", "owner_name": "Ravi Sharma"},
+    {"name": "Component placement",        "url": "#",
+     "status": "In Progress", "due_date": "2026-06-15", "owner_name": "Priya Nair"},
+    {"name": "High-current trace routing", "url": "#",
+     "status": "Not Started", "due_date": "2026-06-17", "owner_name": "Ravi Sharma"},
+]
+
+_PREVIEW_SLIPPED = [
+    {
+        "name": "Thermal simulation report",     "url": "#",
+        "due_date": "2026-06-12", "original_date": "2026-05-30", "slippage_days": 13,
+        "project": {"name": "Motor Drive Gen-3", "url": "#"},
+        "owner_name": "Amit Patel",  "db_name": "Engineering Tasks",
+    },
+    {
+        "name": "Supplier qualification checklist", "url": "#",
+        "due_date": "2026-06-14", "original_date": "2026-06-08", "slippage_days": 6,
+        "project": {"name": "Motor Drive Gen-3", "url": "#"},
+        "owner_name": "Priya Nair", "db_name": "Engineering Tasks",
+    },
+    {
+        "name": "Factory acceptance test plan", "url": "#",
+        "due_date": "2026-06-20", "original_date": "2026-06-16", "slippage_days": 4,
+        "project": {"name": "Drives Commissioning", "url": "#"},
+        "owner_name": "Sonal Mehta", "db_name": "Projects DB",
+    },
+    {
+        "name": "BOM cost review", "url": "#",
+        "due_date": "2026-06-11", "original_date": "2026-06-09", "slippage_days": 2,
+        "project": {"name": "Drives Commissioning", "url": "#"},
+        "owner_name": "Ravi Sharma", "db_name": "Projects DB",
+    },
+]
+
+_PREVIEWS = {
+    "t1-new-task":    lambda: _build_task_assigned_html(_PREVIEW_TASK, "created"),
+    "t1-reassigned":  lambda: _build_task_assigned_html(_PREVIEW_TASK, "reassigned"),
+    "t3-slippage":    lambda: _build_slippage_digest_html(_PREVIEW_SLIPPED),
+    "t4-started":     lambda: _build_project_started_html(_PREVIEW_TASK, _PREVIEW_SUBTASKS),
+    "t5-due-soon":    lambda: _build_due_soon_html(_PREVIEW_TASK, days_until_due=2),
+}
+
+_PREVIEW_LABELS = {
+    "t1-new-task":   "T1 — New Task Assigned",
+    "t1-reassigned": "T1 — Task Reassigned",
+    "t3-slippage":   "T3 — Slippage Digest",
+    "t4-started":    "T4 — Project Started",
+    "t5-due-soon":   "T5 — Due in 2 Days",
+}
+
+
+@app.route("/mis-preview")
+def mis_preview_index():
+    """Landing page — links to every MIS template preview."""
+    links = "".join(
+        f'<li style="margin-bottom:10px;">'
+        f'<a href="/mis-preview/{key}" style="color:#3b82f6;font-size:14px;">'
+        f'{label}</a></li>'
+        for key, label in _PREVIEW_LABELS.items()
+    )
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>MIS Email Previews</title></head>
+<body style="margin:0;padding:40px;background:#f3f4f6;font-family:Arial,sans-serif;">
+<div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;
+            padding:28px 32px;box-shadow:0 1px 4px rgba(0,0,0,.08);">
+  <div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;
+              letter-spacing:.08em;margin-bottom:6px;">MIS Notification Templates</div>
+  <h1 style="font-size:20px;font-weight:800;color:#111827;margin:0 0 20px;">
+    Email Design Previews</h1>
+  <ul style="list-style:none;padding:0;margin:0;">{links}</ul>
+  <p style="margin:20px 0 0;font-size:11px;color:#9ca3af;">
+    Sample data — no Notion queries made. Refresh any page to re-render.</p>
+</div>
+</body></html>"""
+
+
+@app.route("/mis-preview/<name>")
+def mis_preview(name: str):
+    """Render one MIS email template with sample data."""
+    if name not in _PREVIEWS:
+        return (
+            f"Unknown template: {name!r}. "
+            f"Available: {', '.join(_PREVIEWS)}", 404
+        )
+    html = _PREVIEWS[name]()
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
+# ---------------------------------------------------------------------------
+# /jobs — scheduler status dashboard
+# ---------------------------------------------------------------------------
+
+@app.route("/jobs")
+def jobs_dashboard():
+    from scheduler import JOB_STATUS
+
+    def _status_color(s):
+        return {"ok": "#10b981", "error": "#ef4444", "never": "#6b7280"}.get(s, "#6b7280")
+
+    def _status_label(s):
+        return {"ok": "OK", "error": "ERROR", "never": "Never run"}.get(s, s)
+
+    cards = ""
+    for job_id, info in JOB_STATUS.items():
+        color  = _status_color(info["last_status"])
+        label  = _status_label(info["last_status"])
+        err    = (
+            f'<div style="margin-top:8px;padding:8px 10px;background:#fef2f2;'
+            f'border-left:3px solid #ef4444;border-radius:4px;'
+            f'font-size:11px;color:#b91c1c;word-break:break-word;">'
+            f'{info["last_error"]}</div>'
+        ) if info["last_error"] else ""
+        cards += f"""
+<div style="background:#fff;border-radius:10px;border:1px solid #e5e7eb;
+            padding:20px 22px;margin-bottom:16px;
+            box-shadow:0 1px 3px rgba(0,0,0,.06);">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+    <div>
+      <div style="font-size:14px;font-weight:700;color:#111827;">{info['label']}</div>
+      <div style="font-size:12px;color:#6b7280;margin-top:3px;">{info['description']}</div>
+      <div style="font-size:11px;color:#9ca3af;margin-top:6px;">
+        &#128337; {info['schedule']}
+      </div>
+    </div>
+    <div style="text-align:right;flex-shrink:0;margin-left:16px;">
+      <span style="display:inline-block;padding:3px 10px;border-radius:10px;
+                   background:{color};color:#fff;font-size:11px;font-weight:700;">
+        {label}
+      </span>
+      <div style="font-size:11px;color:#9ca3af;margin-top:5px;">
+        {info['last_run'] or '—'}
+      </div>
+    </div>
+  </div>
+  {err}
+  <div style="margin-top:12px;">
+    <a href="/jobs/run/{job_id}"
+       style="display:inline-block;padding:6px 14px;background:#111827;color:#fff;
+              border-radius:6px;text-decoration:none;font-size:12px;font-weight:600;">
+      &#9654; Run now
+    </a>
+  </div>
+</div>"""
+
+    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>MIS Jobs</title></head>
+<body style="margin:0;padding:32px 24px;background:#f3f4f6;font-family:Arial,sans-serif;">
+<div style="max-width:720px;margin:0 auto;">
+  <div style="background:#111827;border-radius:12px;padding:22px 26px;margin-bottom:24px;">
+    <div style="font-size:11px;font-weight:600;color:#6b7280;text-transform:uppercase;
+                letter-spacing:.08em;margin-bottom:4px;">MIS Automation</div>
+    <div style="font-size:20px;font-weight:800;color:#fff;">Scheduled Jobs</div>
+    <div style="font-size:12px;color:#9ca3af;margin-top:4px;">
+      APScheduler · background thread · IST timezone
+    </div>
+  </div>
+  {cards}
+  <p style="font-size:11px;color:#9ca3af;text-align:center;margin-top:8px;">
+    Page does not auto-refresh — reload to see updated status after running a job.
+  </p>
+</div>
+</body></html>"""
+
+
+@app.route("/jobs/run/<job_id>")
+def jobs_run(job_id: str):
+    """Manually trigger a scheduled job and redirect back to /jobs."""
+    from scheduler import job_events, job_health_daily, job_slippage
+    from flask import redirect
+
+    jobs = {
+        "job_events":       job_events,
+        "job_health_daily": job_health_daily,
+        "job_slippage":     job_slippage,
+    }
+    fn = jobs.get(job_id)
+    if not fn:
+        return f"Unknown job: {job_id!r}", 404
+
+    log.info("[Jobs] Manual trigger: %s", job_id)
+    import threading
+    threading.Thread(target=fn, daemon=True).start()
+    return redirect("/jobs")
+
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5000, use_reloader=False)

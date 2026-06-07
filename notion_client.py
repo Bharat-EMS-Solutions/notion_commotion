@@ -464,3 +464,206 @@ def get_task_report(token: str, database_id: str, fields: dict) -> dict:
         "no_owner":    [t for t in tasks if not t["has_owner"]]    if fields.get("owner")    else None,
         "no_reviewer": [t for t in tasks if not t["has_reviewer"]] if fields.get("reviewer") else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# MIS helpers
+# ---------------------------------------------------------------------------
+
+def get_all_tasks_for_mis(
+    token: str, database_id: str, fields: dict, db_name: str
+) -> list[dict]:
+    """
+    Fetch all non-done tasks with full field extraction, including assignee
+    email addresses required by the MIS event detector.
+
+    Returns a list of task dicts, each containing:
+      id, name, url, due_date, status, priority, teams (list), description,
+      slippage_days, original_date, db_name,
+      assignees:    [{name, email}]   — owner/assignee people field
+      team_members: [{name, email}]   — owner + reviewer combined, deduplicated
+      project:      {name, url} | None
+      parent_task:  {name, url} | None
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_API_VERSION,
+        "Content-Type": "application/json",
+    }
+
+    payload: dict = {
+        "filter": {
+            "property": fields["status"],
+            "status": {"does_not_equal": fields["done_value"]},
+        }
+    }
+    url   = f"{_BASE_URL}/databases/{database_id}/query"
+    pages: list[dict] = []
+    while True:
+        resp = requests.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        payload["start_cursor"] = data["next_cursor"]
+
+    raw_tasks: list[dict] = []
+    relation_ids: set[str] = set()
+
+    for page in pages:
+        props = page.get("properties", {})
+
+        title = "".join(
+            t.get("plain_text", "") for t in props.get(fields["title"], {}).get("title", [])
+        ).strip()
+        if not title or title == "(Untitled)":
+            continue
+
+        due_obj  = props.get(fields["due_date"], {}).get("date")
+        due_date = due_obj.get("start") if due_obj else None
+
+        status_name = props.get(fields["status"], {}).get("status", {}).get("name", "") or ""
+
+        slippage_days, original_date = 0, None
+        if fields.get("history"):
+            slippage_days, original_date, _ = _slippage(
+                _rich_text(props.get(fields["history"], {}))
+            )
+
+        description = ""
+        if fields.get("description"):
+            description = _rich_text(props.get(fields["description"], {}))
+
+        priority = ""
+        if fields.get("priority"):
+            priority = (props.get(fields["priority"], {}).get("select") or {}).get("name", "")
+
+        teams: list[str] = []
+        if fields.get("team"):
+            teams = [o.get("name", "") for o in props.get(fields["team"], {}).get("multi_select", [])]
+
+        # Assignees — owner field, with email (requires user-email permission in integration)
+        assignees: list[dict] = []
+        owner_field = fields.get("owner")
+        if owner_field:
+            for person in props.get(owner_field, {}).get("people", []):
+                email = (person.get("person") or {}).get("email", "")
+                assignees.append({
+                    "name":  person.get("name", email or "Unknown"),
+                    "email": email,
+                })
+
+        # Team members = owner(s) + reviewer(s), deduplicated by name
+        team_members: list[dict] = list(assignees)
+        reviewer_field = fields.get("reviewer")
+        if reviewer_field:
+            existing_names = {m["name"] for m in team_members}
+            for person in props.get(reviewer_field, {}).get("people", []):
+                email = (person.get("person") or {}).get("email", "")
+                name  = person.get("name", email or "Unknown")
+                if name not in existing_names:
+                    team_members.append({"name": name, "email": email})
+                    existing_names.add(name)
+
+        proj_rel  = props.get(fields.get("project",      "") or "", {}).get("relation", [])
+        par_rel   = props.get(fields.get("parent_task",  "") or "", {}).get("relation", [])
+        proj_id   = proj_rel[0]["id"] if proj_rel  else None
+        parent_id = par_rel[0]["id"]  if par_rel   else None
+        if proj_id:   relation_ids.add(proj_id)
+        if parent_id: relation_ids.add(parent_id)
+
+        raw_tasks.append({
+            "id":            page["id"],
+            "name":          title,
+            "url":           page.get("url", ""),
+            "due_date":      due_date,
+            "status":        status_name,
+            "priority":      priority,
+            "teams":         teams,
+            "description":   description,
+            "slippage_days": slippage_days,
+            "original_date": original_date,
+            "db_name":       db_name,
+            "assignees":     assignees,
+            "team_members":  team_members,
+            "_project_id":   proj_id,
+            "_parent_id":    parent_id,
+        })
+
+    refs = _fetch_page_refs(relation_ids, headers) if relation_ids else {}
+
+    tasks: list[dict] = []
+    for raw in raw_tasks:
+        pid  = raw.pop("_project_id", None)
+        prid = raw.pop("_parent_id",  None)
+        raw["project"]     = refs.get(pid)  if pid  else None
+        raw["parent_task"] = refs.get(prid) if prid else None
+        tasks.append(raw)
+
+    return tasks
+
+
+def get_subtasks(
+    token: str, database_id: str, fields: dict,
+    parent_page_id: str, db_name: str,
+) -> list[dict]:
+    """
+    Return tasks in this database whose parent_task relation contains parent_page_id.
+    Used to populate the sub-task section of the "project started" email.
+    Returns [] if the parent_task field is not configured or the query fails.
+    """
+    parent_field = fields.get("parent_task")
+    if not parent_field:
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_API_VERSION,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "filter": {
+            "property": parent_field,
+            "relation": {"contains": parent_page_id},
+        }
+    }
+    try:
+        resp = requests.post(
+            f"{_BASE_URL}/databases/{database_id}/query",
+            headers=headers, json=payload, timeout=15,
+        )
+        resp.raise_for_status()
+        pages = resp.json().get("results", [])
+    except Exception:
+        return []
+
+    sub_tasks: list[dict] = []
+    for page in pages:
+        props = page.get("properties", {})
+        title = "".join(
+            t.get("plain_text", "") for t in props.get(fields["title"], {}).get("title", [])
+        ).strip()
+        if not title:
+            continue
+
+        status_name = props.get(fields["status"], {}).get("status", {}).get("name", "") or ""
+        due_obj     = props.get(fields["due_date"], {}).get("date")
+        due_date    = due_obj.get("start") if due_obj else None
+
+        owner_field = fields.get("owner")
+        owner_name  = ""
+        if owner_field:
+            people = props.get(owner_field, {}).get("people", [])
+            if people:
+                owner_name = people[0].get("name", "")
+
+        sub_tasks.append({
+            "name":       title,
+            "url":        page.get("url", ""),
+            "status":     status_name,
+            "due_date":   due_date,
+            "owner_name": owner_name,
+        })
+
+    return sub_tasks
